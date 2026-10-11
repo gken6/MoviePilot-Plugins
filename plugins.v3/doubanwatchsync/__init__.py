@@ -73,7 +73,7 @@ class DoubanWatchSync(AutomaticLogin, WatchManagement, _PluginBase):
     plugin_name = "豆瓣观看同步"
     plugin_desc = "将在看、看完状态同步到豆瓣书影音档案；支持多媒体服务器路由、独立档案与重试队列。"
     plugin_icon = "https://raw.githubusercontent.com/gken6/MoviePilot-Plugins/main/icons/doubanwatchsync.svg"
-    plugin_version = "2.1.0"
+    plugin_version = "2.2.0"
     plugin_author = "gken6"
     author_url = "https://github.com/gken6"
     plugin_config_prefix = "doubanwatchsync_"
@@ -1882,6 +1882,14 @@ class DoubanWatchSync(AutomaticLogin, WatchManagement, _PluginBase):
                             ]},
                         ],
                     },
+                    {
+                        "component": "VRow", "content": [
+                            {"component": "VCol", "props": {"cols": 12}, "content": [
+                                {"component": "VSwitch", "props": {"model": "ai_slider", "label": "使用 MP 智能助手尝试滑块验证"}},
+                                {"component": "p", "text": "复用 MP 模型配置，需要开启图片输入。仅发送验证码区域，每次登录最多尝试一次；可能产生模型调用费用，不能保证验证通过。"},
+                            ]},
+                        ],
+                    },
                 ],
             }
         ], {
@@ -1896,6 +1904,7 @@ class DoubanWatchSync(AutomaticLogin, WatchManagement, _PluginBase):
             "exclude": "",
             "cookie": "",
             "auto_login": False,
+            "ai_slider": False,
             "douban_username": "",
             "douban_password": "",
             "use_cookiecloud": True,

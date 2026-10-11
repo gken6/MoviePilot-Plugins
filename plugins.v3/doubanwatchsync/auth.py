@@ -17,8 +17,8 @@ def credential_key(username: str, password: str) -> str:
     return hashlib.sha256((username + "\0" + password).encode()).hexdigest()
 
 
-def browser_login(username: str, password: str) -> dict:
-    """在独立无头浏览器中登录；不注入现有 Cookie，不自动操作验证码。"""
+def browser_login(username: str, password: str, *, ai_slider: bool = False) -> dict:
+    """独立浏览器登录；仅显式启用 AI 滑块时尝试一次验证。"""
     context = None
     try:
         from app.sdk.browser import launch_browser_context
@@ -32,7 +32,29 @@ def browser_login(username: str, password: str) -> dict:
         page.click(".account-tab-account")
         page.fill('input[name="username"]', username)
         page.fill('input[name="password"]', password)
-        page.click(".account-form-field-submit .btn-account")
+        # 验证要求可能只在接口响应或弹层中出现，不能只检查页面正文。
+        with page.expect_response(lambda response: urlsplit(response.url).hostname == "accounts.douban.com"
+                                  and urlsplit(response.url).path.endswith("/login/basic"), timeout=15000) as pending:
+            page.click(".account-form-field-submit .btn-account")
+        response = pending.value
+        body = response.json()
+        if not isinstance(body, dict) or body.get("status") != "success":
+            text = " ".join(str(body.get(key) or "") for key in
+                            ("message", "description", "localized_message", "msg")).lower() if isinstance(body, dict) else ""
+            payload = body.get("payload") if isinstance(body, dict) else None
+            needs_verification = any(word in text for word in ("captcha", "verify", "verification", "challenge", "验证码", "验证")) or (
+                isinstance(payload, dict) and bool(payload.get("touch_cap_url") and payload.get("tc_app_id")))
+            if needs_verification:
+                if not ai_slider:
+                    return {"status": "需要验证", "message": "豆瓣要求安全验证，自动续登暂停；请完成验证后恢复登录"}
+                from .ai_slider import attempt_slider
+                challenge = attempt_slider(page)
+                if challenge.get("status") != "验证通过":
+                    return challenge
+            elif any(word in text for word in ("password", "credential", "密码")):
+                return {"status": "登录失败", "message": "豆瓣拒绝账号密码登录，请检查手机号或邮箱及密码"}
+            else:
+                return {"status": "登录失败", "message": "豆瓣未确认登录成功，请检查账号密码或稍后重试"}
         # 豆瓣官方页面：成功后跳转；失败留在表单，或进入验证页面。
         # 不保存截图、页面正文、响应或密码，也不把其内容写入日志。
         try:
@@ -80,6 +102,7 @@ class AutomaticLogin:
         if not hasattr(self, "_login_lock"):
             self._login_lock = threading.RLock()
         self._auto_login = bool(config.get("auto_login", False))
+        self._ai_slider = bool(config.get("ai_slider", False))
         self._douban_username = str(config.get("douban_username") or "").strip()
         self._douban_password = str(config.get("douban_password") or "")
         self._credential_key = credential_key(self._douban_username, self._douban_password)
@@ -136,7 +159,7 @@ class AutomaticLogin:
                 return False
             key, username, password = self._credential_key, self._douban_username, self._douban_password
             self.save_data(AUTH_DATA, {**record, "credential_key": key, "status": "正在登录", "message": ""})
-            result = browser_login(username, password)
+            result = browser_login(username, password, ai_slider=True) if self._ai_slider else browser_login(username, password)
             if self._save_auth_result(result, key, record):
                 self._install_login(client, self._auth_record())
                 return True

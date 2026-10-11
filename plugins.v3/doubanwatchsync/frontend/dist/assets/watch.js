@@ -121,6 +121,11 @@ function renderNative(node, model) {
   const component = node.component?.startsWith('V') ? resolveComponent(node.component) : node.component || 'div';
   return h(component, props, node.html ? undefined : typeof component === 'string' ? children : { default: () => children });
 }
+function formFields(row, models) {
+  return row ? { ...row, content: (row.content || []).map(column => ({ ...column,
+    content: (column.content || []).filter(field => models.includes(field.props?.model))
+  })).filter(column => column.content.length) } : null;
+}
 export const Config = defineComponent({
   props: ['initialConfig', 'api', 'pluginId'], emits: ['save', 'close', 'switch', 'layout'],
   setup(props, { emit }) {
@@ -150,10 +155,12 @@ export const Config = defineComponent({
       h('div', { class: 'dw-config-body' }, [
         h('section', { class: 'dw-native' }, [h('h3', 'MoviePilot 媒体服务器'), ...rows.value.slice(0, 4).map(row => renderNative(row, model))]),
         h(ServerManager, { api: props.api, pluginId: props.pluginId }),
-        h('section', { class: 'dw-native dw-settings' }, [h('h3', '豆瓣自动续登'),
+        h('section', { class: 'dw-native dw-settings' }, [h('h3', '豆瓣登录'),
+          ...rows.value.slice(6, 7).map(row => renderNative(row, model)),
+          renderNative(formFields(rows.value[7], ['use_cookiecloud']), model),
           ...rows.value.slice(11, 12).map(row => renderNative(row, model)),
           ...(model.auto_login ? rows.value.slice(12).map(row => renderNative(row, model)) : []),
-          h('p', { class: 'dw-subtle' }, model.auto_login ? '实际同步时检查登录态，Cookie 过期后自动重新获取并重试当前同步。账号密码保存在 NAS 的插件配置中。' : '关闭时沿用上方手填 Cookie 或 CookieCloud；开启后在同步时用豆瓣账号续期失效 Cookie。'),
+          h('p', { class: 'dw-subtle' }, model.auto_login ? '实际同步时检查登录态，Cookie 过期后自动重新获取并重试当前同步。未通过安全验证时暂停续登，观看记录保留待同步。' : '手填 Cookie 留空时，从 MoviePilot 的 CookieCloud 获取豆瓣登录态。'),
           h('div', { class: 'dw-notice', role: 'status', 'aria-live': 'polite' }, [
             h('strong', login.data.value.login?.status || '读取登录状态…'),
             login.data.value.login?.message ? h('p', login.data.value.login.message) : null,
@@ -161,7 +168,12 @@ export const Config = defineComponent({
             login.data.value.login?.next_attempt ? h('small', ` · 重试冷却至：${new Date(login.data.value.login.next_attempt * 1000).toLocaleString()}`) : null,
           ]),
         ]),
-        h('section', { class: 'dw-native dw-settings' }, [h('h3', '同步与显示设置'), ...rows.value.slice(6, 10).map(row => renderNative(row, model))]),
+        h('section', { class: 'dw-native dw-settings' }, [h('h3', '同步操作'),
+          h('p', { class: 'dw-subtle' }, '需要手动处理历史记录时使用；勾选后保存执行一次。'),
+          renderNative(formFields(rows.value[7], ['onlyonce', 'rescan']), model)]),
+        h('section', { class: 'dw-native dw-settings' }, [h('h3', '仪表盘显示'),
+          h('p', { class: 'dw-subtle' }, '控制仪表盘显示的月份、每月条目数量和封面，不影响实际同步。'),
+          ...rows.value.slice(8, 10).map(row => renderNative(row, model))]),
         error.value ? h('div', { role: 'alert', class: 'dw-notice dw-error' }, error.value) : null,
       ]),
       h('footer', { class: 'dw-footer' }, [button('管理同步记录', () => emit('switch')), button(saving.value ? '正在保存…' : '保存设置', save, { primary: true, disabled: saving.value })]),

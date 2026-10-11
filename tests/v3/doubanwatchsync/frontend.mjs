@@ -7,8 +7,10 @@ globalThis.__federation_shared__={default:{vue:{'3':{get:async()=>()=>Vue}}}};
 globalThis.window={addEventListener:(name,fn)=>listeners[name]=fn,removeEventListener:()=>{},dispatchEvent:()=>{}};
 const {Config,Dashboard,Page}=await import(pathToFileURL(new URL('../../../plugins.v3/doubanwatchsync/frontend/dist/assets/watch.js', import.meta.url).pathname));
 const rows=Array.from({length:11},(_,i)=>({component:'VRow',content:[{component:'VSwitch',props:{model:'enabled',label:'row-'+i}}]}));
+rows[7]={component:'VRow',content:['use_cookiecloud','onlyonce','rescan'].map(model=>({component:'VCol',content:[{component:'VSwitch',props:{model,label:model}}]}))};
 rows.push({component:'VRow',content:[{component:'VSwitch',props:{model:'auto_login',label:'Cookie 过期自动重新登录'}}]},
- {component:'VRow',content:[{component:'VTextField',props:{model:'douban_username',label:'豆瓣账号'}},{component:'VTextField',props:{model:'douban_password',label:'豆瓣密码',type:'password'}}]});
+ {component:'VRow',content:[{component:'VTextField',props:{model:'douban_username',label:'豆瓣账号'}},{component:'VTextField',props:{model:'douban_password',label:'豆瓣密码',type:'password'}}]},
+ {component:'VRow',content:[{component:'VSwitch',props:{model:'ai_slider',label:'使用 MP 智能助手尝试滑块验证'}}]});
 const calls=[];
 const props={pluginId:'DoubanWatchSync',initialConfig:{enabled:true},api:{get:async path=>{calls.push(path);return {success:true,data:{conf:[{component:'VForm',content:rows}],model:{enabled:false}}};}}};
 const render=Config.setup(props,{emit:()=>{}});
@@ -16,12 +18,19 @@ await mounted.pop()();
 const tree=render();
 function flatten(node){if(!node||typeof node!=='object')return[];let children=node.children;if(children?.default)children=children.default();return [node,...(Array.isArray(children)?children:[children]).flatMap(flatten)];}
 const fields=flatten(tree).filter(n=>n.type?.name==='VSwitch'&&n.props.label?.startsWith('row-'));
-assert.equal(fields.length,8);assert.ok(fields.every(n=>n.props.modelValue===true));
+assert.equal(fields.length,7);assert.ok(fields.every(n=>n.props.modelValue===true));
 assert.ok(fields.every(n=>!['row-4','row-5','row-10'].includes(n.props.label)));
+for(const title of ['豆瓣登录','同步操作','仪表盘显示']) assert.ok(flatten(tree).some(n=>n.type==='h3'&&n.children===title));
+for(const label of ['use_cookiecloud','onlyonce','rescan']) assert.equal(flatten(tree).filter(n=>n.props.label===label).length,1);
 assert.equal(calls[0],'plugin/form/DoubanWatchSync');
 assert.ok(!flatten(tree).some(n=>n.props.label==='豆瓣密码'));
+assert.ok(!flatten(tree).some(n=>n.props.label==='使用 MP 智能助手尝试滑块验证'));
 flatten(tree).find(n=>n.props.label==='Cookie 过期自动重新登录').props['onUpdate:modelValue'](true);
 const password=flatten(render()).find(n=>n.props.label==='豆瓣密码');
+const aiSlider=flatten(render()).find(n=>n.props.label==='使用 MP 智能助手尝试滑块验证');
+assert.ok(aiSlider);assert.notEqual(aiSlider.props.modelValue,true);
+aiSlider.props['onUpdate:modelValue'](true);
+assert.equal(flatten(render()).find(n=>n.props.label==='使用 MP 智能助手尝试滑块验证').props.modelValue,true);
 assert.equal(password.props.type,'password');
 password.props['onUpdate:modelValue']('simulated-password');
 assert.equal(flatten(render()).find(n=>n.props.label==='豆瓣密码').props.modelValue,'simulated-password');

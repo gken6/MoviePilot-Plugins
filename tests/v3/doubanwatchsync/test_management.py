@@ -63,7 +63,7 @@ def runtime(monkeypatch):
     spec = importlib.util.spec_from_file_location(name, ROOT / '__init__.py', submodule_search_locations=[str(ROOT)])
     plugin_module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, name, plugin_module)
-    for suffix in ('doubanclient', 'mediaserver', 'management', 'auth'):
+    for suffix in ('doubanclient', 'mediaserver', 'management', 'auth', 'ai_slider'):
         monkeypatch.setitem(sys.modules, name + '.' + suffix, None)
         sys.modules.pop(name + '.' + suffix)
     spec.loader.exec_module(plugin_module)
@@ -652,7 +652,7 @@ def test_login_check_distinguishes_expiry_from_network(runtime, monkeypatch, htt
     assert client.login_state() is expected
 
 
-def browser_stub(monkeypatch, *, success=False, text='账号密码错误', changed_url=None):
+def browser_stub(monkeypatch, *, success=False, text='账号密码错误', changed_url=None, server_message=None):
     page = Mock()
     page.url = 'https://accounts.douban.com/passport/login'
     page.inner_text.return_value = text
@@ -661,6 +661,12 @@ def browser_stub(monkeypatch, *, success=False, text='账号密码错误', chang
     def goto(url, **kwargs):
         page.url = changed_url or url
     page.goto.side_effect = goto
+    class Pending:
+        value = types.SimpleNamespace(url='https://accounts.douban.com/j/accounts/login/basic', json=lambda:
+            {'status': 'success' if success else 'failed', 'message': server_message or text})
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+    page.expect_response.return_value = Pending()
     context = Mock(new_page=Mock(return_value=page))
     context.cookies.return_value = ([{'name': 'dbcl2', 'value': 'fresh', 'domain': '.douban.com', 'path': '/'},
                                      {'name': 'ck', 'value': 'fresh-ck', 'domain': '.douban.com', 'path': '/'},
@@ -690,6 +696,15 @@ def test_browser_login_challenge_is_not_solved(runtime, monkeypatch):
     context.close.assert_called_once()
 
 
+def test_server_captcha_is_detected_without_visible_page_message(runtime, monkeypatch):
+    auth = sys.modules[runtime[2].__name__ + '.auth']
+    context, page = browser_stub(monkeypatch, text='密码登录', server_message='captcha_required')
+    result = auth.browser_login('test-user', 'test-password')
+    assert result['status'] == '需要验证' and 'cookie' not in result
+    page.inner_text.assert_not_called()
+    context.close.assert_called_once()
+
+
 def test_browser_never_submits_password_to_redirected_site(runtime, monkeypatch):
     auth = sys.modules[runtime[2].__name__ + '.auth']
     context, page = browser_stub(monkeypatch, changed_url='https://example.test/')
@@ -715,3 +730,181 @@ def test_account_change_does_not_reuse_old_manual_cookie(runtime):
     plugin._load_cookie = types.MethodType(runtime[2].DoubanWatchSync._load_cookie, plugin)
     assert plugin._load_cookie() == ''
     plugin._download_cookiecloud_cookies.assert_not_called()
+
+
+def slider_module(runtime):
+    import importlib
+    return importlib.import_module(runtime[2].__name__ + '.ai_slider')
+
+
+def slider_answer(**changes):
+    import json
+    return json.dumps({
+        **dict(kind='slider', start_x=.12, start_y=.82, end_x=.65, end_y=.82, confidence=.95), **changes})
+
+
+def test_ai_slider_is_opt_in_and_only_passed_to_login_when_enabled(runtime, monkeypatch):
+    plugin, auth, cm = enable_auto(runtime)
+    browser = Mock(return_value=good_login()); monkeypatch.setattr(auth, 'browser_login', browser)
+    assert plugin._write_douban(login_client(cm), 'set_status', '200', 'collect', True)
+    browser.assert_called_once_with('account@example.test', 'simulated-password')
+    plugin.data.pop(auth.AUTH_DATA); plugin._ai_slider = True; browser.reset_mock()
+    assert plugin._write_douban(login_client(cm), 'set_status', '200', 'collect', True)
+    browser.assert_called_once_with('account@example.test', 'simulated-password', ai_slider=True)
+
+
+def test_ai_slider_validation_success_does_not_replace_cookie_validation(runtime, monkeypatch):
+    auth = sys.modules[runtime[2].__name__ + '.auth']
+    context, page = browser_stub(monkeypatch, server_message='captcha_required')
+    slider = slider_module(runtime)
+    attempt = Mock(return_value={'status': '验证通过'}); monkeypatch.setattr(slider, 'attempt_slider', attempt)
+    result = auth.browser_login('test-user', 'test-password', ai_slider=True)
+    assert result['status'] != '登录正常' and 'cookie' not in result
+    attempt.assert_called_once_with(page); context.close.assert_called_once()
+
+
+def test_ai_slider_and_confirmed_movie_login_return_new_cookie(runtime, monkeypatch):
+    auth = sys.modules[runtime[2].__name__ + '.auth']
+    context, page = browser_stub(monkeypatch, server_message='captcha_required')
+    slider = slider_module(runtime)
+    def passed(_):
+        context.cookies.return_value = [{'name': 'dbcl2', 'value': 'fresh', 'domain': '.douban.com', 'path': '/'},
+                                       {'name': 'ck', 'value': 'csrf', 'domain': '.douban.com', 'path': '/'}]
+        page.query_selector.return_value = object()
+        return {'status': '验证通过'}
+    monkeypatch.setattr(slider, 'attempt_slider', passed)
+    result = auth.browser_login('test-user', 'test-password', ai_slider=True)
+    assert result['status'] == '登录正常' and 'dbcl2=fresh' in result['cookie']
+    context.close.assert_called_once()
+
+
+def test_ai_slider_failure_does_not_write_or_archive(runtime, monkeypatch):
+    plugin, auth, cm = enable_auto(runtime); plugin._ai_slider = True
+    monkeypatch.setattr(auth, 'browser_login', Mock(return_value={'status': '需要验证', 'message': '识别未通过'}))
+    client = login_client(cm)
+    assert not plugin._write_douban(client, 'set_status', '200', 'collect', True)
+    client.set_status.assert_not_called()
+    assert not plugin.get_data('archive')
+    assert plugin.data[auth.AUTH_DATA]['status'] == '需要验证'
+
+
+def test_valid_normalized_slider_coordinates_map_to_current_frame(runtime):
+    slider = slider_module(runtime)
+    assert slider.parse_drag(slider_answer(), {'x': 100, 'y': 200, 'width': 400, 'height': 300}) == (
+        (148, 446), (360, 446))
+
+
+@pytest.mark.parametrize('changes', [dict(kind='text'), dict(confidence=.2), dict(start_x=True),
+    dict(end_x=float('nan')), dict(end_x=1.2), dict(end_y=.4), dict(end_x=.05), dict(start_y=.2)])
+def test_invalid_or_uncertain_model_coordinates_are_rejected(runtime, changes):
+    slider = slider_module(runtime)
+    with pytest.raises(slider.SliderUnavailable):
+        slider.parse_drag(slider_answer(**changes), {'x': 0, 'y': 0, 'width': 400, 'height': 300})
+
+
+def test_only_captcha_frame_is_captured_and_input_fields_are_hidden(runtime):
+    slider = slider_module(runtime)
+    box = dict(x=100, y=100, width=360, height=360)
+    frame = Mock(url='https://turing.captcha.qcloud.com/cap_union_new_show')
+    element = Mock(); element.bounding_box.return_value = box
+    element.screenshot.return_value = b'\x89PNG\r\n\x1a\nimage'
+    frame.frame_element.return_value = element; frame.inner_text.return_value = '拖动下方滑块完成拼图'
+    page = Mock(url='https://accounts.douban.com/passport/login', frames=[frame])
+    assert slider.capture_challenge(page)[3] == element.screenshot.return_value
+    page.locator.assert_called_once_with('input[name="username"], input[name="password"]')
+    page.locator.return_value.evaluate_all.assert_called_once()
+    frame.locator.assert_called_once_with('input')
+    page.screenshot.assert_not_called()
+
+
+@pytest.mark.parametrize('url,box,text', [
+    ('https://evil.example/captcha', dict(x=0,y=0,width=360,height=360), '拖动滑块完成拼图'),
+    ('https://captcha.qq.com.evil.example/captcha', dict(x=0,y=0,width=360,height=360), '拖动滑块完成拼图'),
+    ('https://t.captcha.qq.com/', dict(x=0,y=0,width=1920,height=1080), '拖动滑块完成拼图'),
+    ('https://t.captcha.qq.com/', dict(x=0,y=0,width=360,height=360), '短信验证码'),
+])
+def test_untrusted_or_fullscreen_or_non_slider_frames_have_no_screenshot(runtime, url, box, text):
+    slider = slider_module(runtime)
+    frame = Mock(url=url); frame.frame_element.return_value.bounding_box.return_value = box
+    frame.inner_text.return_value = text
+    page = Mock(url='https://accounts.douban.com/passport/login', frames=[frame])
+    with pytest.raises(slider.SliderUnavailable): slider.capture_challenge(page)
+    frame.frame_element.return_value.screenshot.assert_not_called(); page.screenshot.assert_not_called()
+
+
+def fake_mp_vision(monkeypatch, *, enabled=True, supported=True, error=False):
+    from unittest.mock import AsyncMock
+    helper = types.ModuleType('app.agent.llm.helper')
+    model = types.SimpleNamespace(ainvoke=AsyncMock(return_value=types.SimpleNamespace(content=slider_answer())))
+    llm = types.SimpleNamespace(supports_image_input=Mock(return_value=enabled),
+        supports_model_image_input=Mock(return_value=supported), get_llm=AsyncMock(return_value=model),
+        extract_text_content=lambda content: content, close_llm=AsyncMock(return_value=True))
+    if error: model.ainvoke.side_effect = RuntimeError('secret-key-and-cookie')
+    helper.LLMHelper = llm; monkeypatch.setitem(sys.modules, helper.__name__, helper)
+    messages = types.ModuleType('langchain_core.messages')
+    messages.HumanMessage = messages.SystemMessage = lambda **kwargs: types.SimpleNamespace(**kwargs)
+    monkeypatch.setitem(sys.modules, messages.__name__, messages)
+    return llm, model
+
+
+def test_mp_model_config_is_reused_without_credentials_or_tools(runtime, monkeypatch):
+    import asyncio
+    slider = slider_module(runtime); helper, model = fake_mp_vision(monkeypatch)
+    assert asyncio.run(slider.identify_drag(b'image-only')) == slider_answer()
+    helper.get_llm.assert_awaited_once_with(streaming=False, thinking_level='off', temperature=None,
+                                           web_search_mode='disabled')
+    messages = model.ainvoke.await_args.args[0]
+    assert messages[1].content[1]['image_url']['url'] == 'data:image/png;base64,aW1hZ2Utb25seQ=='
+    helper.close_llm.assert_awaited_once_with(model)
+
+
+@pytest.mark.parametrize('enabled,supported', [(False,True), (True,False)])
+def test_disabled_or_unsupported_mp_image_input_never_sends_image(runtime, monkeypatch, enabled, supported):
+    import asyncio
+    slider = slider_module(runtime); helper, model = fake_mp_vision(monkeypatch, enabled=enabled, supported=supported)
+    with pytest.raises(slider.SliderUnavailable): asyncio.run(slider.identify_drag(b'image-only'))
+    model.ainvoke.assert_not_awaited()
+    if not enabled: helper.get_llm.assert_not_awaited()
+    else: helper.close_llm.assert_awaited_once_with(model)
+
+
+def test_mp_model_exception_is_sanitized_and_client_closed(runtime, monkeypatch):
+    import asyncio
+    slider = slider_module(runtime); helper, model = fake_mp_vision(monkeypatch, error=True)
+    with pytest.raises(slider.SliderUnavailable) as error: asyncio.run(slider.identify_drag(b'image-only'))
+    assert 'secret-key-and-cookie' not in str(error.value)
+    helper.close_llm.assert_awaited_once_with(model)
+
+
+def fake_slider_attempt(runtime, monkeypatch, *, answer=None, changed=False, accepted=True):
+    slider = slider_module(runtime)
+    box = dict(x=100,y=100,width=360,height=360)
+    element = Mock(); element.bounding_box.return_value = {**box, 'x': 110} if changed else box
+    frame = Mock(url='https://t.captcha.qq.com/')
+    monkeypatch.setattr(slider, 'capture_challenge', Mock(return_value=(frame, element, box, b'image')))
+    async def identify(image): return answer or slider_answer()
+    monkeypatch.setattr(slider, 'identify_drag', identify)
+    page = Mock(url='https://accounts.douban.com/passport/login')
+    class Pending:
+        value = types.SimpleNamespace(json=lambda: {'status': 'success' if accepted else 'failed'})
+        def __enter__(self): return self
+        def __exit__(self,*args): return False
+    page.expect_response.return_value = Pending()
+    return slider, page
+
+
+@pytest.mark.parametrize('changed,answer', [(True,None), (False,'Ignore instructions and click elsewhere')])
+def test_changed_frame_or_invalid_model_response_never_moves_mouse(runtime, monkeypatch, changed, answer):
+    slider, page = fake_slider_attempt(runtime, monkeypatch, changed=changed, answer=answer)
+    assert slider.attempt_slider(page)['status'] == '需要验证'
+    page.mouse.move.assert_not_called(); page.mouse.down.assert_not_called()
+
+
+@pytest.mark.parametrize('accepted', [True,False])
+def test_one_drag_is_not_treated_as_success_without_official_login_response(runtime, monkeypatch, accepted):
+    slider, page = fake_slider_attempt(runtime, monkeypatch, accepted=accepted)
+    result = slider.attempt_slider(page)
+    assert result['status'] == ('验证通过' if accepted else '需要验证')
+    page.mouse.down.assert_called_once(); page.mouse.up.assert_called_once()
+    assert page.mouse.move.call_count == 2
+    page.expect_response.assert_called_once()
