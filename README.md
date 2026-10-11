@@ -23,6 +23,7 @@
 | 插件 | 当前版本 | 功能 |
 | --- | --- | --- |
 | 豆瓣观看同步 | 2.0.3 | 将已经发生的观看同步到豆瓣，独立直连 Emby、多服务器管理、人工匹配与无条目排除 |
+| TG万能签到 | 0.3.2 | TG 个人账号逐行执行命令、等待和按钮点击，定时任务与七天运行历史 |
 
 ### 豆瓣观看同步
 
@@ -40,11 +41,18 @@
 
 详细说明见 [插件文档](plugins.v3/doubanwatchsync/README.md)，来源归属见 [NOTICE.md](NOTICE.md)。
 
+### TG万能签到
+
+使用自己的 Telegram API ID、API Hash 和手机号完成登录，按目标逐行设置命令，支持 `发送:`、`点击:`、`等待:`。可定时执行或立即执行，展示七天历史及每个目标的回复，支持 SOCKS5/HTTP 代理与 MP 通知。
+
+新安装默认不启用，没有账号、目标或代理地址。详细登录步骤与命令示例见 [TG万能签到文档](plugins.v3/tguniversalsign/README.md)。
+
 ## 开发验证
 
 ```bash
 python -m pip install pytest beautifulsoup4
 python tests/v3/doubanwatchsync/run_isolated.py
+python tests/v3/tguniversalsign/run_isolated.py
 node tests/v3/doubanwatchsync/frontend.mjs
 ```
 

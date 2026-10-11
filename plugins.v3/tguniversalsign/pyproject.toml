@@ -1,0 +1,10 @@
+[project]
+name = "moviepilot-plugin-tguniversalsign"
+version = "0.3.2"
+description = "Telegram personal-account sign-in tasks for MoviePilot V3"
+requires-python = ">=3.12"
+dependencies = [
+  "Telethon==1.44.0",
+  "python-socks[asyncio]",
+  "PySocks",
+]

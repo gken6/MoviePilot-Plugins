@@ -17,6 +17,10 @@ for identifier, entry in index.items():
     assert entry['author'] == values['plugin_author']
     assert entry['name'] == values['plugin_name']
     assert entry['icon'] == values['plugin_icon']
-    assert (source.parent / 'frontend/dist/assets/remoteEntry.js').is_file()
+    if any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == 'get_render_mode'
+           for node in cls.body):
+        assert (source.parent / 'frontend/dist/assets/remoteEntry.js').is_file()
+    else:
+        assert any(isinstance(node, ast.FunctionDef) and node.name == 'get_form' for node in cls.body)
     assert entry['release'] is False, 'Source installation uses main branch'
     print(identifier, entry['version'], 'metadata verified')
