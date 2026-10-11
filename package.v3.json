@@ -2,7 +2,7 @@
   "DoubanWatchSync": {
     "name": "豆瓣观看同步",
     "description": "将观看状态同步到豆瓣，支持独立直连 Emby、多服务器管理、人工匹配与无条目排除。",
-    "version": "2.2.1",
+    "version": "2.3.0",
     "author": "gken6",
     "level": 1,
     "icon": "https://raw.githubusercontent.com/gken6/MoviePilot-Plugins/main/icons/doubanwatchsync.svg",
@@ -11,6 +11,7 @@
     "plugin_schema_version": 1,
     "release": false,
     "history": {
+      "2.3.0": "移除 AI 滑块验证；账号登录失败后发送官方二维码通知，扫码确认并核验 Cookie 后继续当前同步。",
       "2.2.1": "适配实际腾讯验证码域名，修复同步浏览器与异步模型调用兼容问题；真实 AI 测试未取得 Cookie。",
       "2.2.0": "可选复用 MP 智能助手识别滑块，一次登录最多尝试一次；改进验证提示并拆分登录、同步和仪表盘设置。",
       "2.1.0": "支持账号密码无头浏览器登录、Cookie 过期自动续登、按同步触发续登与失败冷却重试。",

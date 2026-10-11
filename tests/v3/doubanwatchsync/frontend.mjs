@@ -9,8 +9,7 @@ const {Config,Dashboard,Page}=await import(pathToFileURL(new URL('../../../plugi
 const rows=Array.from({length:11},(_,i)=>({component:'VRow',content:[{component:'VSwitch',props:{model:'enabled',label:'row-'+i}}]}));
 rows[7]={component:'VRow',content:['use_cookiecloud','onlyonce','rescan'].map(model=>({component:'VCol',content:[{component:'VSwitch',props:{model,label:model}}]}))};
 rows.push({component:'VRow',content:[{component:'VSwitch',props:{model:'auto_login',label:'Cookie 过期自动重新登录'}}]},
- {component:'VRow',content:[{component:'VTextField',props:{model:'douban_username',label:'豆瓣账号'}},{component:'VTextField',props:{model:'douban_password',label:'豆瓣密码',type:'password'}}]},
- {component:'VRow',content:[{component:'VSwitch',props:{model:'ai_slider',label:'使用 MP 智能助手尝试滑块验证'}}]});
+ {component:'VRow',content:[{component:'VTextField',props:{model:'douban_username',label:'豆瓣账号'}},{component:'VTextField',props:{model:'douban_password',label:'豆瓣密码',type:'password'}}]});
 const calls=[];
 const props={pluginId:'DoubanWatchSync',initialConfig:{enabled:true},api:{get:async path=>{calls.push(path);return {success:true,data:{conf:[{component:'VForm',content:rows}],model:{enabled:false}}};}}};
 const render=Config.setup(props,{emit:()=>{}});
@@ -27,10 +26,6 @@ assert.ok(!flatten(tree).some(n=>n.props.label==='豆瓣密码'));
 assert.ok(!flatten(tree).some(n=>n.props.label==='使用 MP 智能助手尝试滑块验证'));
 flatten(tree).find(n=>n.props.label==='Cookie 过期自动重新登录').props['onUpdate:modelValue'](true);
 const password=flatten(render()).find(n=>n.props.label==='豆瓣密码');
-const aiSlider=flatten(render()).find(n=>n.props.label==='使用 MP 智能助手尝试滑块验证');
-assert.ok(aiSlider);assert.notEqual(aiSlider.props.modelValue,true);
-aiSlider.props['onUpdate:modelValue'](true);
-assert.equal(flatten(render()).find(n=>n.props.label==='使用 MP 智能助手尝试滑块验证').props.modelValue,true);
 assert.equal(password.props.type,'password');
 password.props['onUpdate:modelValue']('simulated-password');
 assert.equal(flatten(render()).find(n=>n.props.label==='豆瓣密码').props.modelValue,'simulated-password');
@@ -59,4 +54,4 @@ flatten(failedPage()).find(n=>n.props['aria-label']==='修正 / 重新同步').p
 await flatten(failedPage()).find(n=>n.props['aria-label']==='重新同步').props.onClick();
 assert.ok(flatten(failedPage()).some(n=>n.props.role==='alert'&&n.children==='明确失败'));
 for(const fn of unmounted)fn();
-console.log('前端配置、MP 模型、仪表盘刷新、影片/剧集状态选项、所选状态提交及失败提示：通过');
+console.log('前端配置、登录控制、仪表盘刷新、影片/剧集状态选项、所选状态提交及失败提示：通过');

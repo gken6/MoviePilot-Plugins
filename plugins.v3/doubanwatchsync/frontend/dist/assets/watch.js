@@ -139,6 +139,7 @@ export const Config = defineComponent({
         rows.value = form.conf?.[0]?.content || [];
         if (!rows.value.length) throw new Error('配置控件加载失败，请刷新后重试');
         Object.assign(model, { ...form.model, ...(props.initialConfig || {}) });
+        delete model.ai_slider;
       } catch (e) { error.value = e.message || '配置加载失败'; }
     });
     async function save() {
@@ -160,10 +161,16 @@ export const Config = defineComponent({
           renderNative(formFields(rows.value[7], ['use_cookiecloud']), model),
           ...rows.value.slice(11, 12).map(row => renderNative(row, model)),
           ...(model.auto_login ? rows.value.slice(12).map(row => renderNative(row, model)) : []),
-          h('p', { class: 'dw-subtle' }, model.auto_login ? '实际同步时检查登录态，Cookie 过期后自动重新获取并重试当前同步。未通过安全验证时暂停续登，观看记录保留待同步。' : '手填 Cookie 留空时，从 MoviePilot 的 CookieCloud 获取豆瓣登录态。'),
+          h('p', { class: 'dw-subtle' }, model.auto_login ? '实际同步时检查登录态，Cookie 过期后自动重新获取并重试当前同步。账号登录失败时通过 MP 通知发送二维码，扫码确认后保存 Cookie 并继续同步。' : '手填 Cookie 留空时，从 MoviePilot 的 CookieCloud 获取豆瓣登录态。'),
+          model.auto_login ? button('获取登录 Cookie', () => login.mutate('login', {}), { disabled: ['正在登录', '等待扫码'].includes(login.data.value.login?.status) }) : null,
+          notification(login),
           h('div', { class: 'dw-notice', role: 'status', 'aria-live': 'polite' }, [
             h('strong', login.data.value.login?.status || '读取登录状态…'),
             login.data.value.login?.message ? h('p', login.data.value.login.message) : null,
+            login.data.value.login?.qr_image ? h('div', { class: 'dw-login-qr' }, [
+              h('img', { src: login.data.value.login.qr_image, alt: '豆瓣登录二维码', width: 200, height: 200, referrerpolicy: 'no-referrer' }),
+              h('p', '请用豆瓣 App 扫码并确认登录'),
+            ]) : null,
             login.data.value.login?.last_login ? h('small', `上次自动登录：${new Date(login.data.value.login.last_login * 1000).toLocaleString()}`) : null,
             login.data.value.login?.next_attempt ? h('small', ` · 重试冷却至：${new Date(login.data.value.login.next_attempt * 1000).toLocaleString()}`) : null,
           ]),

@@ -77,8 +77,28 @@ class WatchManagement:
         return [
             {"path": "/manage", "endpoint": self.api_management, "methods": ["GET"], "auth": "bear", "dependencies": [Depends(require_manager)]},
             {"path": "/servers", "endpoint": self.api_server, "methods": ["POST"], "auth": "bear", "dependencies": [Depends(require_manager)]},
+            {"path": "/login", "endpoint": self.api_login, "methods": ["POST"], "auth": "bear", "dependencies": [Depends(require_manager)]},
             {"path": "/match", "endpoint": self.api_match, "methods": ["POST"], "auth": "bear", "dependencies": [Depends(require_manager)]},
         ]
+
+    def api_login(self) -> dict:
+        """手动获取登录态，后台执行；不写入任何豆瓣观看记录。"""
+        if not self._auth_ready():
+            return {"success": False, "message": "请先启用插件及自动续登，填写豆瓣账号密码并保存"}
+        with self._lock:
+            if getattr(self, "_login_manual_pending", False) or getattr(self, "_login_active_key", None) == self._credential_key or getattr(self, "_login_qr", None):
+                return {"success": True, "message": "已有登录任务，请等待账号登录或扫码确认"}
+            self._login_manual_pending = True
+        def run():
+            try:
+                with self._login_lock:
+                    record = self._auth_record()
+                    self.save_data("douban_login", {**record, "credential_key": self._credential_key, "next_attempt": 0})
+                    self._prepare_login(DoubanClient(cookie=self._load_cookie()), force=True)
+            finally:
+                self._login_manual_pending = False
+        self._schedule_once("login_only", run, "获取豆瓣登录 Cookie", 1)
+        return {"success": True, "message": "已开始获取 Cookie；账号登录失败时将发送二维码通知"}
 
     def api_management(self) -> dict:
         """返回界面数据，不返回直连密码、Token、Cookie 或用户 ID。"""

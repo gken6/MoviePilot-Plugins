@@ -17,8 +17,71 @@ def credential_key(username: str, password: str) -> str:
     return hashlib.sha256((username + "\0" + password).encode()).hexdigest()
 
 
-def browser_login(username: str, password: str, *, ai_slider: bool = False) -> dict:
-    """独立浏览器登录；仅显式启用 AI 滑块时尝试一次验证。"""
+def _verified_cookie(context, page) -> dict | None:
+    """Cookie 和电影站账号导航均确认后才接受登录。"""
+    domains = {"douban.com", "movie.douban.com"}
+    if not any(c.get("name") == "dbcl2" and c.get("value")
+               and str(c.get("domain") or "").lstrip(".") in domains for c in context.cookies()):
+        return None
+    page.goto(MOVIE_HOME, wait_until="domcontentloaded", timeout=30000)
+    if urlsplit(page.url).hostname != "movie.douban.com" or not page.query_selector("#db-global-nav .nav-user-account"):
+        return None
+    values = {}
+    for cookie in sorted(context.cookies(), key=lambda c: str(c.get("domain") or "").lstrip(".") == "movie.douban.com"):
+        if str(cookie.get("domain") or "").lstrip(".") in domains and cookie.get("value") and cookie.get("path", "/") == "/":
+            values[str(cookie["name"])] = str(cookie["value"])
+    if values.get("dbcl2") and values.get("ck"):
+        return {"status": "登录正常", "cookie": "; ".join(f"{k}={v}" for k, v in values.items()),
+                "user_agent": page.evaluate("navigator.userAgent")}
+    return None
+
+
+def _qr_image_url(value) -> bool:
+    if not isinstance(value, str) or len(value) > 2048:
+        return False
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return False
+    host = parsed.hostname or ""
+    return (parsed.scheme == "https" and not parsed.username and not parsed.password
+            and port in (None, 443) and not parsed.fragment
+            and (host == "accounts.douban.com" or host.endswith(".doubanio.com")))
+
+
+def _qr_login(context, page, on_qr, should_continue) -> dict:
+    """官方页面负责扫码状态轮询；不提交或识别验证码。"""
+    page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
+    if urlsplit(page.url).scheme != "https" or urlsplit(page.url).hostname != "accounts.douban.com":
+        return {"status": "登录失败", "message": "扫码登录页面地址异常"}
+    with page.expect_response(lambda response: urlsplit(response.url).hostname == "accounts.douban.com"
+                              and urlsplit(response.url).path.endswith("/qrlogin_code"), timeout=15000) as pending:
+        page.click(".account-tab-switch a.quick")
+    body = pending.value.json()
+    payload = body.get("payload") if isinstance(body, dict) else None
+    image = payload.get("img") if isinstance(payload, dict) else None
+    if not isinstance(body, dict) or body.get("status") != "success" or not isinstance(payload, dict) or not payload.get("code") or not _qr_image_url(image):
+        return {"status": "登录失败", "message": "豆瓣未提供可用登录二维码，下次同步时重试"}
+    page.wait_for_selector(".account-qr-scan img", timeout=15000)
+    expires_at = time.time() + 360  # 与官方页面 120 次、每 3 秒轮询的上限一致。
+    if not should_continue() or on_qr(image, expires_at) is False:
+        return {"status": "登录取消", "message": "扫码登录已取消"}
+    while time.time() < expires_at:
+        if not should_continue():
+            return {"status": "登录取消", "message": "配置已改变或插件已停用，扫码登录取消"}
+        result = _verified_cookie(context, page)
+        if result:
+            return result
+        failed = page.query_selector(".account-qr-fail")
+        if failed and failed.is_visible():
+            return {"status": "二维码已过期", "message": "登录二维码已失效，观看记录保留待同步；下次重试会发送新二维码"}
+        page.wait_for_timeout(1500)
+    return {"status": "二维码已过期", "message": "未在有效期内确认扫码登录，观看记录保留待同步"}
+
+
+def browser_login(username: str, password: str, *, on_qr=None, should_continue=None) -> dict:
+    """先尝试账号密码；无法确认登录时，通知二维码并等待用户扫码。"""
     context = None
     try:
         from app.sdk.browser import launch_browser_context
@@ -29,63 +92,37 @@ def browser_login(username: str, password: str, *, ai_slider: bool = False) -> d
         page.wait_for_selector(".account-tab-account")
         if urlsplit(page.url).scheme != "https" or urlsplit(page.url).hostname != "accounts.douban.com":
             return {"status": "登录失败", "message": "登录页面地址异常，未提交账号密码"}
-        page.click(".account-tab-account")
-        page.fill('input[name="username"]', username)
-        page.fill('input[name="password"]', password)
-        # 验证要求可能只在接口响应或弹层中出现，不能只检查页面正文。
-        with page.expect_response(lambda response: urlsplit(response.url).hostname == "accounts.douban.com"
-                                  and urlsplit(response.url).path.endswith("/login/basic"), timeout=15000) as pending:
-            page.click(".account-form-field-submit .btn-account")
-        response = pending.value
-        body = response.json()
-        if not isinstance(body, dict) or body.get("status") != "success":
-            text = " ".join(str(body.get(key) or "") for key in
-                            ("message", "description", "localized_message", "msg")).lower() if isinstance(body, dict) else ""
-            payload = body.get("payload") if isinstance(body, dict) else None
-            needs_verification = any(word in text for word in ("captcha", "verify", "verification", "challenge", "验证码", "验证")) or (
-                isinstance(payload, dict) and bool(payload.get("touch_cap_url") and payload.get("tc_app_id")))
-            if needs_verification:
-                if not ai_slider:
-                    return {"status": "需要验证", "message": "豆瓣要求安全验证，自动续登暂停；请完成验证后恢复登录"}
-                from .ai_slider import attempt_slider
-                challenge = attempt_slider(page)
-                if challenge.get("status") != "验证通过":
-                    return challenge
-            elif any(word in text for word in ("password", "credential", "密码")):
-                return {"status": "登录失败", "message": "豆瓣拒绝账号密码登录，请检查手机号或邮箱及密码"}
-            else:
-                return {"status": "登录失败", "message": "豆瓣未确认登录成功，请检查账号密码或稍后重试"}
-        # 豆瓣官方页面：成功后跳转；失败留在表单，或进入验证页面。
-        # 不保存截图、页面正文、响应或密码，也不把其内容写入日志。
+        failure = {"status": "登录失败", "message": "豆瓣未确认账号登录成功"}
         try:
-            page.wait_for_function("""() => location.pathname !== '/passport/login' ||
-                [...document.querySelectorAll('.account-form-error')].some(e => e.innerText.trim()) ||
-                [...document.querySelectorAll('iframe[src*="captcha"], .geetest_panel')]
-                    .some(e => e.getBoundingClientRect().height > 0)""", timeout=30000)
+            page.click(".account-tab-account")
+            page.fill('input[name="username"]', username)
+            page.fill('input[name="password"]', password)
+            with page.expect_response(lambda response: urlsplit(response.url).hostname == "accounts.douban.com"
+                                      and urlsplit(response.url).path.endswith("/login/basic"), timeout=15000) as pending:
+                page.click(".account-form-field-submit .btn-account")
+            body = pending.value.json()
+            if isinstance(body, dict) and body.get("status") == "success":
+                try:
+                    page.wait_for_function("() => location.pathname !== '/passport/login'", timeout=15000)
+                except Exception:
+                    pass
+                result = _verified_cookie(context, page)
+                if result:
+                    return result
+            else:
+                text = " ".join(str(body.get(key) or "") for key in ("message", "description", "localized_message", "msg")).lower() if isinstance(body, dict) else ""
+                payload = body.get("payload") if isinstance(body, dict) else None
+                if any(word in text for word in ("captcha", "verify", "verification", "challenge", "验证码", "验证")) or (
+                        isinstance(payload, dict) and payload.get("touch_cap_url") and payload.get("tc_app_id")):
+                    failure = {"status": "需要验证", "message": "豆瓣要求安全验证，请使用扫码登录"}
+                elif any(word in text for word in ("password", "credential", "密码")):
+                    failure = {"status": "登录失败", "message": "豆瓣拒绝账号密码登录，请检查账号或使用扫码登录"}
         except Exception:
-            pass
-        candidate = {str(c.get("name")): str(c.get("value")) for c in context.cookies()
-                     if str(c.get("domain") or "").lstrip(".") in {"douban.com", "movie.douban.com"}
-                     and c.get("value") and c.get("name") in {"dbcl2", "ck"}}
-        if candidate.get("dbcl2"):
-            page.goto(MOVIE_HOME, wait_until="domcontentloaded", timeout=30000)
-            if urlsplit(page.url).hostname == "movie.douban.com" and page.query_selector("#db-global-nav .nav-user-account"):
-                values = {}
-                # 根域的登录 Cookie 可供电影站使用，电影站同名 Cookie 优先。
-                cookies = sorted(context.cookies(), key=lambda c: str(c.get("domain") or "").lstrip(".") == "movie.douban.com")
-                for cookie in cookies:
-                    if str(cookie.get("domain") or "").lstrip(".") in {"douban.com", "movie.douban.com"} and cookie.get("value") and cookie.get("path", "/") == "/":
-                        values[str(cookie["name"])] = str(cookie["value"])
-                if values.get("dbcl2") and values.get("ck"):
-                    return {"status": "登录正常", "cookie": "; ".join(f"{k}={v}" for k, v in values.items()),
-                            "user_agent": page.evaluate("navigator.userAgent")}
-        # 只把页面文本用于分类，返回预定义消息，防止豆瓣回显账号进入日志。
-        text = page.inner_text("body")
-        if any(word in text for word in ("验证码", "短信验证", "安全验证", "异常登录", "滑动", "拖动", "安全检测")) or "abnormal" in page.url:
-            return {"status": "需要验证", "message": "豆瓣要求安全验证，自动续登暂停；请完成验证后恢复登录"}
-        return {"status": "登录失败", "message": "豆瓣未确认登录成功，请检查账号密码或稍后重试"}
+            failure = {"status": "登录失败", "message": "账号登录未完成，请检查 NAS 网络或使用扫码登录"}
+        if on_qr:
+            return _qr_login(context, page, on_qr, should_continue or (lambda: True))
+        return failure
     except Exception:
-        # 浏览器异常可能带有页面/参数，不输出异常内容。
         return {"status": "登录失败", "message": "无法完成浏览器登录，请检查 NAS 网络和浏览器运行环境"}
     finally:
         if context is not None:
@@ -102,10 +139,12 @@ class AutomaticLogin:
         if not hasattr(self, "_login_lock"):
             self._login_lock = threading.RLock()
         self._auto_login = bool(config.get("auto_login", False))
-        self._ai_slider = bool(config.get("ai_slider", False))
         self._douban_username = str(config.get("douban_username") or "").strip()
         self._douban_password = str(config.get("douban_password") or "")
+        old_key = getattr(self, "_credential_key", "")
         self._credential_key = credential_key(self._douban_username, self._douban_password)
+        if old_key != self._credential_key or not self._auto_login:
+            self._login_qr = None
 
     def _auth_ready(self) -> bool:
         return self._auto_login and self._enabled and bool(self._douban_username and self._douban_password)
@@ -120,8 +159,32 @@ class AutomaticLogin:
         if not self._douban_username or not self._douban_password:
             return {"status": "未配置账号", "message": "请填写豆瓣账号和密码后保存"}
         record = self._auth_record()
-        return {key: record.get(key) for key in ("status", "message", "last_login", "checked_at", "next_attempt")
-                if record.get(key) is not None} or {"status": "等待同步触发"}
+        public = {key: record.get(key) for key in ("status", "message", "last_login", "checked_at", "next_attempt", "qr_expires_at")
+                  if record.get(key) is not None} or {"status": "等待同步触发"}
+        qr = getattr(self, "_login_qr", None)
+        if qr and qr["key"] == self._credential_key and qr["expires_at"] > time.time() and self._auth_ready():
+            public["qr_image"] = qr["image"]
+        elif public.get("status") == "正在登录" and getattr(self, "_login_active_key", None) != self._credential_key:
+            public.update(status="等待同步触发", message="上次登录会话已结束，下次同步时重新获取登录态")
+        elif public.get("status") == "等待扫码":
+            public.update(status="扫码已结束", message="扫码会话已结束，请在下一次同步或失败重试时重新获取二维码")
+        return public
+
+    def _notify_login_qr(self, image: str, expires_at: float, key: str) -> bool:
+        if not self._auth_ready() or key != self._credential_key:
+            return False
+        self._login_qr = {"key": key, "image": image, "expires_at": expires_at}
+        message = "账号登录未成功，请打开豆瓣 App 扫描登录二维码，并在手机上确认。二维码最多有效 6 分钟，确认后继续同步。"
+        self.save_data(AUTH_DATA, {"credential_key": key, "status": "等待扫码", "message": message,
+                                  "qr_expires_at": expires_at, "next_attempt": 0})
+        try:
+            from app.schemas.types import MessageType
+            self.post_message(mtype=MessageType.Plugin, title="豆瓣观看同步：请扫码登录", text=message, image=image)
+        except Exception:
+            self.save_data(AUTH_DATA, {"credential_key": key, "status": "等待扫码", "message": "二维码通知提交失败，请打开插件的豆瓣登录设置扫码确认",
+                                      "qr_expires_at": expires_at, "next_attempt": 0})
+            logger.warn("豆瓣登录二维码通知提交失败，可在插件设置中查看二维码")
+        return True
 
     def _save_auth_result(self, result: dict, key: str, previous: dict) -> bool:
         if not self._auth_ready() or key != self._credential_key:
@@ -159,7 +222,16 @@ class AutomaticLogin:
                 return False
             key, username, password = self._credential_key, self._douban_username, self._douban_password
             self.save_data(AUTH_DATA, {**record, "credential_key": key, "status": "正在登录", "message": ""})
-            result = browser_login(username, password, ai_slider=True) if self._ai_slider else browser_login(username, password)
+            self._login_active_key = key
+            try:
+                result = browser_login(username, password,
+                                       on_qr=lambda image, expiry: self._notify_login_qr(image, expiry, key),
+                                       should_continue=lambda: self._auth_ready() and key == self._credential_key)
+            except Exception:
+                result = {"status": "登录失败", "message": "登录流程未完成，请稍后重试"}
+            finally:
+                self._login_qr = None
+                self._login_active_key = None
             if self._save_auth_result(result, key, record):
                 self._install_login(client, self._auth_record())
                 return True
