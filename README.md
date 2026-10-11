@@ -22,10 +22,12 @@
 
 | 插件 | 当前版本 | 功能 |
 | --- | --- | --- |
-| 豆瓣观看同步 | 2.3.1 | 将已经发生的观看同步到豆瓣，独立直连 Emby、多服务器管理、人工匹配与无条目排除 |
+| 豆瓣观看同步 | 2.3.3 | 将已经发生的观看同步到豆瓣，独立直连 Emby、多服务器管理、人工匹配与无条目排除 |
 | TG万能签到 | 0.3.2 | TG 个人账号逐行执行命令、等待和按钮点击，定时任务与七天运行历史 |
 
 ### 豆瓣观看同步
+
+感谢 [honue](https://github.com/honue/MoviePilot-Plugins) 的“豆瓣书影音档案”插件：读取 MP 已配置媒体服务器的非直连功能参考该作者改编；独立直连 Emby 部分由 gken6 自主提出并设计。
 
 - 沿用 MoviePilot 已配置媒体服务器的事件处理和观看状态判定。
 - 直连 Emby 独立管理：服务器名、地址、账号、密码，添加后自动获取 Token 和用户 ID。
@@ -35,7 +37,7 @@
 - 仪表盘展示观看档案、豆瓣标题和封面。
 - 豆瓣写入失败保留提示和重试入口；更换编号时先写新条目，再尝试撤销旧标记。
 
-需要有效的豆瓣 Cookie，可使用插件配置或 MoviePilot 的 CookieCloud。直连账号只存放在本插件数据中，管理接口不返回密码、Token 或用户 ID。
+同步时依次尝试插件保存的 Cookie、已启用的 CookieCloud、已配置的账号登录。账号遇到滑块验证或登录失败时通过 MP 发送二维码，扫码确认后保存 Cookie 并继续同步。直连账号只存放在本插件数据中，管理接口不返回密码、Token 或用户 ID。
 
 撤销旧豆瓣标记必须能从官方页面核实接口；无法核实或执行失败时保留“旧标记待撤销”提示。此流程已有模拟测试，尚未完成真实豆瓣账号的端到端撤销验证。
 
@@ -50,7 +52,7 @@
 ## 开发验证
 
 ```bash
-python -m pip install pytest beautifulsoup4
+python -m pip install pytest beautifulsoup4 Pillow
 python tests/v3/doubanwatchsync/run_isolated.py
 python tests/v3/tguniversalsign/run_isolated.py
 node tests/v3/doubanwatchsync/frontend.mjs

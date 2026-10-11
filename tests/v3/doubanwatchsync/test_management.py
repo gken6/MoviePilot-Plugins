@@ -64,7 +64,7 @@ def runtime(monkeypatch):
     spec = importlib.util.spec_from_file_location(name, ROOT / '__init__.py', submodule_search_locations=[str(ROOT)])
     plugin_module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, name, plugin_module)
-    for suffix in ('doubanclient', 'mediaserver', 'management', 'auth'):
+    for suffix in ('doubanclient', 'mediaserver', 'management', 'auth', 'qrnotify'):
         monkeypatch.setitem(sys.modules, name + '.' + suffix, None)
         sys.modules.pop(name + '.' + suffix)
     spec.loader.exec_module(plugin_module)
@@ -97,11 +97,15 @@ def archive_record(plugin, key='movie@direct-a', subject='100'):
 
 
 def fake_client(monkeypatch, management, *, remove=True, write=True, detail=True):
-    client = Mock()
-    client.has_login.return_value = True
-    client.get_subject_info.return_value = {'title': 'correct title', 'image': 'https://img.example.test/cover.jpg'} if detail else None
-    client.set_status.return_value = write
-    client.remove_status.return_value = remove
+    client = management.DoubanClient(cookie='dbcl2=local; ck=local')
+    client.login_state = Mock(return_value=True)
+    client.get_subject_info = Mock(return_value={'title': 'correct title', 'image': 'https://img.example.test/cover.jpg'} if detail else None)
+    client.set_status = Mock(return_value=write)
+    client.remove_status = Mock(return_value=remove)
+    calls = Mock()
+    calls.attach_mock(client.set_status, 'set_status')
+    calls.attach_mock(client.remove_status, 'remove_status')
+    client.method_calls = calls.method_calls
     client.last_error = 'simulated removal failure' if not remove else ''
     monkeypatch.setattr(management, 'DoubanClient', lambda **kwargs: client)
     return client
@@ -613,8 +617,9 @@ def test_disabled_auto_login_never_uses_browser(runtime, monkeypatch):
     plugin._auto_login = False
     browser = Mock(side_effect=AssertionError('disabled')); monkeypatch.setattr(auth, 'browser_login', browser)
     client = login_client(cm)
+    client.login_state.return_value = True
     assert plugin._write_douban(client, 'set_status', '200', 'collect', True)
-    client.login_state.assert_not_called(); browser.assert_not_called()
+    client.login_state.assert_called_once(); browser.assert_not_called()
 
 
 def test_late_login_cannot_save_cookie_after_account_change(runtime, monkeypatch):
@@ -734,31 +739,31 @@ def test_account_change_does_not_reuse_old_manual_cookie(runtime):
 
 
 
-def test_qr_notification_uses_mp_and_exposes_only_active_image(runtime):
-    import time
+def test_qr_notification_uses_mp_and_exposes_only_active_image(runtime, monkeypatch):
+    import time, importlib
     plugin, auth, _ = enable_auto(runtime)
-    plugin.post_message = Mock()
+    qn = importlib.import_module(runtime[2].__name__ + '.qrnotify')
+    sender = Mock(return_value={'sent': 1, 'failed': 0}); monkeypatch.setattr(qn, 'send_qr_notifications', sender)
     image = 'https://img9.doubanio.com/view/qr/test.jpg'
     assert plugin._notify_login_qr(image, time.time() + 360, plugin._credential_key)
-    plugin.post_message.assert_called_once()
-    assert plugin.post_message.call_args.kwargs['image'] == image
-    assert plugin.post_message.call_args.kwargs['link'] == image
+    sender.assert_called_once()
+    assert sender.call_args.args[1] == image
     assert plugin._auth_public()['status'] == '等待扫码'
     assert plugin._auth_public()['qr_image'] == image
     assert 'qr_image' not in plugin.get_data(auth.AUTH_DATA)
-    assert 'simulated-password' not in str(plugin.post_message.call_args)
+    assert 'simulated-password' not in str(sender.call_args)
     plugin._enabled = False
     assert 'qr_image' not in plugin._auth_public()
 
 
-def test_qr_notification_failure_keeps_local_qr(runtime):
-    import time
+def test_qr_notification_failure_keeps_local_qr(runtime, monkeypatch):
+    import time, importlib
     plugin, auth, _ = enable_auto(runtime)
-    plugin.post_message = Mock(side_effect=RuntimeError('secret-notification-key'))
+    qn = importlib.import_module(runtime[2].__name__ + '.qrnotify')
+    monkeypatch.setattr(qn, 'send_qr_notifications', Mock(return_value={'sent':0,'failed':1}))
     plugin._notify_login_qr('https://img9.doubanio.com/qr.jpg', time.time()+60, plugin._credential_key)
     public = plugin._auth_public()
-    assert public['qr_image'] and '通知提交失败' in public['message']
-    assert 'secret-notification-key' not in str(public)
+    assert public['qr_image'] and '图片发送失败' in public['message']
 
 
 def test_qr_account_change_cannot_notify_or_save_cookie(runtime):
@@ -803,6 +808,7 @@ def qr_browser(runtime, monkeypatch):
     page.expect_response.return_value.value = types.SimpleNamespace(json=lambda: {'status': 'success',
         'payload': {'code': 'opaque-test-session', 'img': 'https://img9.doubanio.com/qr.jpg'}})
     page.query_selector.return_value = None
+    page.locator.return_value.get_attribute.return_value = 'data:image/png;base64,iVBORw0KGgo='
     return auth, context, page
 
 
@@ -848,7 +854,9 @@ def test_login_api_is_async_deduplicated_and_never_marks_watched(runtime, monkey
 
 
 def test_qr_success_resumes_original_write_once(runtime, monkeypatch):
-    import time
+    import time, importlib
+    qn = importlib.import_module(runtime[2].__name__ + ".qrnotify")
+    monkeypatch.setattr(qn, "send_qr_notifications", Mock(return_value={"sent":1,"failed":0}))
     plugin, auth, cm = enable_auto(runtime)
     plugin.post_message = Mock()
     def login(username, password, *, on_qr, should_continue):
@@ -870,7 +878,7 @@ def test_qr_wait_is_bounded_without_scan(runtime, monkeypatch):
     notify = Mock()
     result = auth._qr_login(context, page, notify, lambda: True)
     assert result['status'] == '二维码已过期' and 'cookie' not in result
-    notify.assert_called_once_with('https://img9.doubanio.com/qr.jpg', 460)
+    notify.assert_called_once_with('https://img9.doubanio.com/qr.jpg', 460, b'\x89PNG\r\n\x1a\n')
     page.wait_for_timeout.assert_called_once()
 
 
@@ -889,3 +897,348 @@ def test_old_login_status_does_not_block_new_login_after_restart(runtime):
     assert plugin._auth_public()['status'] == '等待同步触发'
     assert plugin.api_login()['success']
     assert any(job[0] == 'login_only' for job in runtime[3])
+
+
+def qr_notify_env(runtime, monkeypatch):
+    import importlib
+    qn = importlib.import_module(runtime[2].__name__ + '.qrnotify')
+    message_module = types.ModuleType('app.schemas.message')
+    message_module.Message = lambda **kwargs: types.SimpleNamespace(**kwargs)
+    monkeypatch.setitem(sys.modules, 'app.schemas.message', message_module)
+    client = Mock()
+    client._appid = 'configured-app'
+    client._send_msg_url = 'configured-send-endpoint'
+    client._upload_temp_media.return_value = 'private-media-id'
+    client._WeChat__post_request.return_value = True
+    module = Mock()
+    module.get_instance.return_value = client
+    module.check_message.return_value = True
+    module.get_notification_userid.return_value = 'configured-admin'
+    service = types.SimpleNamespace(name='configured-wechat', type='wechat', module=module,
+                                    config=types.SimpleNamespace(enabled=True), instance=client)
+    monkeypatch.setattr(sys.modules['app.sdk.services'], 'NotificationHelper',
+                        lambda: types.SimpleNamespace(iterate_module_instances=lambda: iter([service])), raising=False)
+    plugin = runtime[0]; plugin.chain = Mock(); plugin.post_message = Mock()
+    monkeypatch.setattr(qn, '_routed_messages', lambda chain, message: [message])
+    paths = []
+    def download(image, directory):
+        p = directory / 'qr.png'; p.write_bytes(b'test-QR'); paths.append(p); return p
+    monkeypatch.setattr(qn, '_download_qr', download)
+    return qn, plugin, module, client, service, paths
+
+
+def test_wechat_qr_is_image_message_without_link_and_temp_file_is_deleted(runtime, monkeypatch):
+    qn, plugin, module, client, service, paths = qr_notify_env(runtime, monkeypatch)
+    result = qn.send_qr_notifications(plugin, 'https://img9.doubanio.com/qr.png', '请扫码')
+    assert result == {'sent':1,'failed':0,'skipped':0,'failures':[]}
+    client._upload_temp_media.assert_called_once_with(paths[0], media_type='image')
+    payload = client._WeChat__post_request.call_args.args[1]
+    assert payload == {'touser':'configured-admin', 'msgtype':'image', 'agentid':'configured-app',
+                       'image':{'media_id':'private-media-id'}}
+    assert not any(p.exists() for p in paths)
+    plugin.post_message.assert_not_called()
+    module.check_message.assert_called_once()
+    module.get_notification_userid.assert_called_once()
+
+
+def test_disabled_wechat_channel_is_not_sent(runtime, monkeypatch):
+    qn, plugin, module, client, service, paths = qr_notify_env(runtime, monkeypatch)
+    service.config.enabled = False
+    assert not qn.send_qr_notifications(plugin, 'image', 'text')['sent']
+    module.check_message.assert_not_called(); client._upload_temp_media.assert_not_called()
+    assert not paths
+
+
+def test_filtered_plugin_message_never_downloads_or_uploads_qr(runtime, monkeypatch):
+    qn, plugin, module, client, service, paths = qr_notify_env(runtime, monkeypatch)
+    module.check_message.return_value = False
+    assert qn.send_qr_notifications(plugin, 'image', 'text')['skipped'] == 1
+    client._upload_temp_media.assert_not_called()
+    assert not paths
+
+
+@pytest.mark.parametrize('stage', ['upload', 'send', 'exception', 'unsupported'])
+def test_wechat_picture_failure_does_not_fallback_to_link(runtime, monkeypatch, stage):
+    qn, plugin, module, client, service, paths = qr_notify_env(runtime, monkeypatch)
+    if stage == 'upload': client._upload_temp_media.return_value = None
+    if stage == 'send': client._WeChat__post_request.return_value = False
+    if stage == 'exception': client._WeChat__post_request.side_effect = RuntimeError('secret-token')
+    if stage == 'unsupported': client._WeChat__post_request = None
+    result = qn.send_qr_notifications(plugin, 'image', 'text')
+    assert result['failed'] == 1 and result['sent'] == 0
+    plugin.post_message.assert_not_called()
+    assert not any(p.exists() for p in paths)
+    assert 'secret-token' not in str(sys.modules['app.sdk.logging'].logger.warn.call_args_list)
+
+
+def test_other_notification_channels_keep_mp_image_delivery(runtime, monkeypatch):
+    qn, plugin, module, client, service, paths = qr_notify_env(runtime, monkeypatch)
+    service.type = 'telegram'
+    assert qn.send_qr_notifications(plugin, 'official-image', 'text')['sent'] == 1
+    assert plugin.post_message.call_args.kwargs['source'] == 'configured-wechat'
+    assert plugin.post_message.call_args.kwargs['image'] == 'official-image'
+    client._upload_temp_media.assert_not_called()
+
+
+def test_wechat_qr_uses_host_routing_and_admin_bindings(runtime, monkeypatch):
+    import importlib
+    qn = importlib.import_module(runtime[2].__name__ + '.qrnotify')
+    api = types.ModuleType('app.chain._messaging')
+    class Lookup:
+        username = 'host-admin'
+    class Delivery:
+        def __init__(self, message): self.message = message
+    api._NotificationRouteLookup = Lookup; api._NotificationRouteDelivery = Delivery
+    api._notification_route_action = Mock(return_value='admin')
+    def route(message, *, action, superuser):
+        assert action == 'admin' and superuser == 'host-admin'
+        bindings = yield Lookup()
+        message.targets = bindings
+        yield Delivery(message)
+    api._notification_route_steps = route
+    monkeypatch.setitem(sys.modules, 'app.chain._messaging', api)
+    chain = Mock(); chain.runtime_config.superuser = 'host-admin'
+    chain._normalize_notification_for_dispatch.side_effect = lambda message: message
+    chain.user_repository.get_notification_settings.return_value = {'wechat_userid':'bound-admin'}
+    messages = list(qn._routed_messages(chain, types.SimpleNamespace()))
+    assert messages[0].targets == {'wechat_userid':'bound-admin'}
+    chain.user_repository.get_notification_settings.assert_called_once_with('host-admin')
+
+
+@pytest.mark.parametrize('bad', ['untrusted', 'redirect', 'oversize', 'not_image'])
+def test_qr_image_download_rejects_invalid_content(runtime, monkeypatch, tmp_path, bad):
+    import importlib
+    qn = importlib.import_module(runtime[2].__name__ + '.qrnotify')
+    response = types.SimpleNamespace(status_code=200, url='https://img9.doubanio.com/qr.png', content=b'not-image')
+    if bad == 'redirect': response.url = 'https://evil.test/qr.png'
+    if bad == 'oversize': response.content = b'x' * (2*1024*1024+1)
+    mock = Mock(return_value=Mock(get_res=Mock(return_value=response)))
+    monkeypatch.setattr(sys.modules['app.sdk.network'], 'RequestUtils', mock)
+    image = 'https://evil.test/qr' if bad == 'untrusted' else 'https://img9.doubanio.com/qr.png'
+    with pytest.raises(Exception): qn._download_qr(image, tmp_path)
+    assert not list(tmp_path.iterdir())
+    if bad == 'untrusted': mock.assert_not_called()
+
+
+def test_browser_qr_png_is_used_directly_without_image_download(runtime, monkeypatch):
+    import io
+    from PIL import Image
+    qn, plugin, module, client, service, paths = qr_notify_env(runtime, monkeypatch)
+    download = Mock(side_effect=AssertionError('must not download URL'))
+    monkeypatch.setattr(qn, '_download_qr', download)
+    raw = io.BytesIO(); Image.new('RGB',(128,128),'white').save(raw,format='PNG')
+    result = qn.send_qr_notifications(plugin, 'https://img9.doubanio.com/qr.png', 'text', qr_png=raw.getvalue())
+    assert result['sent'] == 1 and result['failed'] == 0
+    download.assert_not_called()
+    image_path = client._upload_temp_media.call_args.args[0]
+    assert image_path.suffix == '.png' and not image_path.exists()
+
+
+@pytest.mark.parametrize('src', ['https://evil.test/image', 'data:image/svg+xml;base64,PHN2Zz4=',
+                                 'data:image/png;base64,YmFkLWltYWdl'])
+def test_login_page_without_valid_qr_png_never_notifies(runtime, monkeypatch, src):
+    auth, context, page = qr_browser(runtime, monkeypatch)
+    page.locator.return_value.get_attribute.return_value = src
+    notify = Mock()
+    result = auth._qr_login(context, page, notify, lambda: True)
+    assert result['status'] == '登录失败'
+    notify.assert_not_called()
+
+
+def test_late_picture_notification_cannot_overwrite_new_account_state(runtime, monkeypatch):
+    import time, importlib
+    plugin, auth, _ = enable_auto(runtime)
+    qn = importlib.import_module(runtime[2].__name__ + '.qrnotify')
+    old = plugin._credential_key
+    def notify(*args, **kwargs):
+        plugin._auth_init({'auto_login':True,'douban_username':'new','douban_password':'new'})
+        plugin.save_data(auth.AUTH_DATA, {'credential_key':plugin._credential_key,'status':'正在登录'})
+        raise RuntimeError('notification failed')
+    monkeypatch.setattr(qn,'send_qr_notifications',notify)
+    assert not plugin._notify_login_qr('https://img9.doubanio.com/qr.png',time.time()+60,old)
+    assert plugin.get_data(auth.AUTH_DATA)['credential_key'] == plugin._credential_key
+
+
+@pytest.mark.parametrize('auto_login', [True, False])
+def test_saved_cookie_has_priority_and_does_not_read_cloud(runtime, monkeypatch, auto_login):
+    plugin, auth, cm = enable_auto(runtime)
+    plugin._auto_login = auto_login
+    plugin.save_data(auth.AUTH_DATA, {'credential_key': plugin._credential_key, **good_login()})
+    plugin._download_cookiecloud_cookies = Mock(side_effect=AssertionError('local cookie is valid'))
+    browser = Mock(side_effect=AssertionError('local cookie is valid'))
+    monkeypatch.setattr(auth, 'browser_login', browser)
+    client = login_client(cm)
+    client.login_state.side_effect = lambda: client.cookies.get('dbcl2') == 'fresh'
+    assert plugin._write_douban(client, 'set_status', '200', 'collect', True)
+    assert client.cookies['dbcl2'] == 'fresh'
+    plugin._download_cookiecloud_cookies.assert_not_called()
+    browser.assert_not_called()
+
+
+def test_expired_local_uses_cloud_before_browser_and_saves_cloud(runtime, monkeypatch):
+    plugin, auth, cm = enable_auto(runtime)
+    plugin.save_data(auth.AUTH_DATA, {'credential_key': plugin._credential_key, 'cookie': 'dbcl2=local; ck=old', 'user_agent': 'old-agent'})
+    events = []
+    def cloud():
+        events.append('cloud')
+        return {'douban.com': 'dbcl2=cloud; ck=cloud-ck'}, ''
+    plugin._download_cookiecloud_cookies = Mock(side_effect=cloud)
+    browser = Mock(side_effect=AssertionError('cloud cookie works'))
+    monkeypatch.setattr(auth, 'browser_login', browser)
+    client = login_client(cm)
+    def check():
+        events.append('check:' + client.cookies.get('dbcl2', ''))
+        return client.cookies.get('dbcl2') == 'cloud'
+    client.login_state.side_effect = check
+    assert plugin._write_douban(client, 'set_status', '200', 'collect', True)
+    assert events == ['check:local', 'cloud', 'check:cloud']
+    assert client._parse_cookie(plugin._auth_record()['cookie']) == {'dbcl2': 'cloud', 'ck': 'cloud-ck'}
+    assert client.user_agent == ''
+    browser.assert_not_called()
+    again = login_client(cm)
+    again.login_state = Mock(side_effect=AssertionError('recent saved cookie'))
+    assert plugin._write_douban(again, 'set_status', '201', 'collect', True)
+    plugin._download_cookiecloud_cookies.assert_called_once()
+
+
+def test_both_cookie_sources_expired_then_browser_login(runtime, monkeypatch):
+    plugin, auth, cm = enable_auto(runtime)
+    events = []
+    def cloud():
+        events.append('cloud')
+        return {'douban.com': 'dbcl2=cloud-expired; ck=old'}, ''
+    def browser(*args, **kwargs):
+        events.append('browser')
+        return good_login()
+    plugin._download_cookiecloud_cookies = Mock(side_effect=cloud)
+    monkeypatch.setattr(auth, 'browser_login', Mock(side_effect=browser))
+    client = login_client(cm, 'dbcl2=local-expired; ck=old')
+    def check():
+        events.append('check:' + client.cookies['dbcl2'])
+        return False
+    client.login_state.side_effect = check
+    assert plugin._write_douban(client, 'set_status', '200', 'collect', True)
+    assert events == ['check:local-expired', 'cloud', 'check:cloud-expired', 'browser']
+    client.set_status.assert_called_once()
+    assert plugin._auth_record()['cookie'] == good_login()['cookie']
+
+
+def test_cloud_switch_off_skips_download_then_logs_in(runtime, monkeypatch):
+    plugin, auth, cm = enable_auto(runtime)
+    plugin._use_cookiecloud = False
+    plugin._download_cookiecloud_cookies = Mock(side_effect=AssertionError('disabled cloud'))
+    browser = Mock(return_value=good_login())
+    monkeypatch.setattr(auth, 'browser_login', browser)
+    assert plugin._write_douban(login_client(cm), 'set_status', '200', 'collect', True)
+    plugin._download_cookiecloud_cookies.assert_not_called()
+    browser.assert_called_once()
+
+
+@pytest.mark.parametrize('cookie', ['', 'dbcl2=expired; ck=old'])
+def test_cloud_works_without_enabled_account_login(runtime, monkeypatch, cookie):
+    plugin, auth, cm = enable_auto(runtime)
+    plugin._auto_login = False
+    plugin._douban_username = plugin._douban_password = ''
+    plugin._download_cookiecloud_cookies = Mock(return_value=({'douban.com': 'dbcl2=cloud; ck=cloud-ck'}, ''))
+    browser = Mock(side_effect=AssertionError('account login disabled'))
+    monkeypatch.setattr(auth, 'browser_login', browser)
+    client = login_client(cm, cookie)
+    client.login_state.side_effect = lambda: client.cookies.get('dbcl2') == 'cloud'
+    assert plugin._write_douban(client, 'set_status', '200', 'collect', True)
+    assert client._parse_cookie(plugin._auth_record()['cookie']) == {'dbcl2': 'cloud', 'ck': 'cloud-ck'}
+    browser.assert_not_called()
+
+
+def test_valid_cookie_works_without_configured_account(runtime, monkeypatch):
+    plugin, auth, cm = enable_auto(runtime)
+    plugin._douban_username = plugin._douban_password = ''
+    plugin._download_cookiecloud_cookies = Mock(side_effect=AssertionError('valid cookie'))
+    monkeypatch.setattr(auth, 'browser_login', Mock(side_effect=AssertionError('no account')))
+    client = login_client(cm); client.login_state.return_value = True
+    assert plugin._write_douban(client, 'set_status', '200', 'collect', True)
+
+
+def test_identical_expired_cloud_cookie_is_not_rechecked(runtime, monkeypatch):
+    plugin, auth, cm = enable_auto(runtime)
+    plugin._download_cookiecloud_cookies = Mock(return_value=({'douban.com': 'ck=old; dbcl2=expired'}, ''))
+    browser = Mock(return_value=good_login()); monkeypatch.setattr(auth, 'browser_login', browser)
+    client = login_client(cm)
+    assert plugin._write_douban(client, 'set_status', '200', 'collect', True)
+    client.login_state.assert_called_once()
+    browser.assert_called_once()
+
+
+def test_sudden_expiry_switches_to_cloud_and_retries_write_once(runtime, monkeypatch):
+    import time
+    plugin, auth, cm = enable_auto(runtime)
+    client = login_client(cm)
+    plugin.save_data(auth.AUTH_DATA, {'credential_key': plugin._credential_key, 'cookie': client.cookie_header(),
+                                    'status': '登录正常', 'checked_at': time.time()})
+    plugin._download_cookiecloud_cookies = Mock(return_value=({'douban.com': 'dbcl2=cloud; ck=cloud-ck'}, ''))
+    client.login_state.side_effect = lambda: client.cookies.get('dbcl2') == 'cloud'
+    client.set_status.side_effect = [False, True]
+    browser = Mock(side_effect=AssertionError('cloud handles expiry')); monkeypatch.setattr(auth, 'browser_login', browser)
+    assert plugin._write_douban(client, 'set_status', '200', 'collect', True)
+    assert client.set_status.call_count == 2
+    assert client.login_state.call_count == 2  # failed local, then cloud; rejected local is not checked twice.
+    browser.assert_not_called()
+
+
+def test_cloud_check_network_error_does_not_trigger_account_login(runtime, monkeypatch):
+    plugin, auth, cm = enable_auto(runtime)
+    plugin._download_cookiecloud_cookies = Mock(return_value=({'douban.com': 'dbcl2=cloud; ck=cloud-ck'}, ''))
+    browser = Mock(side_effect=AssertionError('network is not expiry')); monkeypatch.setattr(auth, 'browser_login', browser)
+    client = login_client(cm)
+    client.login_state.side_effect = lambda: None if client.cookies.get('dbcl2') == 'cloud' else False
+    client.set_status.return_value = False
+    assert not plugin._write_douban(client, 'set_status', '200', 'collect', True)
+    assert plugin._auth_record()['status'] == '检查失败'
+    browser.assert_not_called()
+
+
+def test_account_change_allows_explicit_cloud_fallback(runtime, monkeypatch):
+    plugin, auth, cm = enable_auto(runtime)
+    plugin.save_data(auth.AUTH_DATA, {'credential_key': plugin._credential_key, **good_login()})
+    plugin._auth_init({'auto_login': True, 'douban_username': 'new@example.test', 'douban_password': 'new-secret'})
+    plugin._cookie = 'dbcl2=old-manual; ck=old'
+    plugin._load_cookie = types.MethodType(runtime[2].DoubanWatchSync._load_cookie, plugin)
+    assert plugin._load_cookie() == ''
+    plugin._download_cookiecloud_cookies = Mock(return_value=({'douban.com': 'dbcl2=cloud; ck=cloud-ck'}, ''))
+    monkeypatch.setattr(auth, 'browser_login', Mock(side_effect=AssertionError('cloud works')))
+    client = login_client(cm, '')
+    client.login_state.return_value = True
+    assert plugin._write_douban(client, 'set_status', '200', 'collect', True)
+    assert client.cookies['dbcl2'] == 'cloud'
+
+
+def test_config_change_during_cookie_check_does_not_save_late_result(runtime):
+    plugin, auth, cm = enable_auto(runtime)
+    client = login_client(cm)
+    def check():
+        plugin._auth_init({'auto_login': True, 'douban_username': 'new@example.test', 'douban_password': 'new-secret'})
+        plugin.save_data(auth.AUTH_DATA, {'credential_key': plugin._credential_key, 'status': '等待同步触发'})
+        return False
+    client.login_state.side_effect = check
+    assert not plugin._write_douban(client, 'set_status', '200', 'collect', True)
+    assert plugin._auth_record() == {'credential_key': plugin._credential_key, 'status': '等待同步触发'}
+    client.set_status.assert_not_called()
+
+
+def test_manual_correction_with_no_local_cookie_can_use_cloud(runtime, monkeypatch):
+    plugin, management, _, _ = runtime
+    key = archive_record(plugin)
+    plugin._load_cookie = Mock(return_value='')
+    plugin._download_cookiecloud_cookies = Mock(return_value=({'douban.com': 'dbcl2=cloud; ck=cloud-ck'}, ''))
+    cm = sys.modules[runtime[2].__name__ + '.doubanclient']
+    client = cm.DoubanClient('')
+    client.login_state = Mock(side_effect=lambda: client.cookies.get('dbcl2') == 'cloud')
+    client.get_subject_info = Mock(return_value={'title': 'correct title', 'image': ''})
+    client.set_status = Mock(return_value=True)
+    client.remove_status = Mock(return_value=True)
+    monkeypatch.setattr(management, 'DoubanClient', lambda **kwargs: client)
+    assert plugin.api_match({'key': key, 'subject_id': '200'})['success']
+    plugin._run_correction(key)
+    client.set_status.assert_called_once_with('200', 'collect', True)
+    client.remove_status.assert_called_once_with('100')
+    assert plugin.get_data('archive')[key]['subject_id'] == '200'
+    plugin._download_cookiecloud_cookies.assert_called_once()

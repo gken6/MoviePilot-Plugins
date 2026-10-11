@@ -73,7 +73,7 @@ class DoubanWatchSync(AutomaticLogin, WatchManagement, _PluginBase):
     plugin_name = "豆瓣观看同步"
     plugin_desc = "将在看、看完状态同步到豆瓣书影音档案；支持多媒体服务器路由、独立档案与重试队列。"
     plugin_icon = "https://raw.githubusercontent.com/gken6/MoviePilot-Plugins/main/icons/doubanwatchsync.svg"
-    plugin_version = "2.3.1"
+    plugin_version = "2.3.3"
     plugin_author = "gken6"
     author_url = "https://github.com/gken6"
     plugin_config_prefix = "doubanwatchsync_"
@@ -721,10 +721,6 @@ class DoubanWatchSync(AutomaticLogin, WatchManagement, _PluginBase):
             return
 
         client = DoubanClient(cookie=self._load_cookie())
-        if not client.has_login() and not self._auto_login:
-            logger.error("豆瓣 cookie 为空，无法同步，请配置 cookie 或 CookieCloud")
-            self._save_pending(key, payload, subject_name or title, season, media_type, status, subject_id)
-            return
 
         display = self._display_title(subject_name or title, season)
         if self._write_douban(client, "set_status", subject_id=subject_id, status=status, private=self._private):
@@ -759,9 +755,6 @@ class DoubanWatchSync(AutomaticLogin, WatchManagement, _PluginBase):
 
         logger.info(f"开始重试豆瓣同步失败队列，共 {len(pending)} 条")
         client = DoubanClient(cookie=self._load_cookie())
-        if not client.has_login() and not self._auto_login:
-            logger.error("豆瓣 cookie 为空，跳过本次重试")
-            return
 
         for key, record in pending.items():
             with self._get_record_lock(key):
@@ -819,10 +812,6 @@ class DoubanWatchSync(AutomaticLogin, WatchManagement, _PluginBase):
             return summary
 
         client = DoubanClient(cookie=self._load_cookie())
-        if not client.has_login() and not self._auto_login:
-            logger.error("豆瓣 cookie 为空，无法重扫档案")
-            summary["failed"] = len(archive)
-            return summary
 
         summary["total"] = len(archive)
         logger.info(f"开始重扫豆瓣档案，共 {summary['total']} 条")
@@ -1155,25 +1144,19 @@ class DoubanWatchSync(AutomaticLogin, WatchManagement, _PluginBase):
             return False
 
     def _load_cookie(self) -> str:
-        """读取豆瓣 cookie：优先插件配置，其次 MoviePilot CookieCloud。
+        """只读取插件本地 Cookie；失效后在实际写入流程中读取 CookieCloud。"""
+        current = str(self._auth_record().get("cookie") or "")
+        if current:
+            return current
+        saved = self.get_data("douban_login") or {}
+        if saved and saved.get("credential_key") != self._credential_key:
+            return ""  # 账号改变后不复用原账号遗留的手填 Cookie。
+        return self._cookie.strip()
 
-        不自行拼远程 POST，也不假定 CookieCloud 返回明文；默认复用宿主内置
-        CookieCloudHelper，因它已经处理本地服务、远程下载、解密和域名归并。
-        如果保留了旧配置中的独立 host/key/password，则只临时覆盖 helper 实例字段，
-        不写回全局配置，也不记录敏感值。
-        """
-        if self._auto_login:
-            current = str(self._auth_record().get("cookie") or "")
-            if current:
-                return current
-            # 更换账号后不回退到旧账号遗留的手填/云同步 Cookie。
-            if self.get_data("douban_login"):
-                return ""
-        if self._cookie.strip():
-            return self._cookie.strip()
+    def _load_cookiecloud(self) -> str:
+        """复用宿主下载、解密和域名归并；关闭开关时不读取。"""
         if not self._use_cookiecloud:
             return ""
-
         cookies, error = self._download_cookiecloud_cookies()
         if error:
             logger.warn(f"从 CookieCloud 获取 cookie 失败：{error}")
@@ -1818,7 +1801,7 @@ class DoubanWatchSync(AutomaticLogin, WatchManagement, _PluginBase):
                         "component": "VRow",
                         "content": [
                             {"component": "VCol", "props": {"cols": 12},
-                             "content": [{"component": "VTextField", "props": {"model": "cookie", "label": "豆瓣cookie", "placeholder": "留空则从 CookieCloud 获取"}}]},
+                             "content": [{"component": "VTextField", "props": {"model": "cookie", "label": "豆瓣cookie", "placeholder": "可留空，成功登录后由插件保存"}}]},
                         ],
                     },
                     {

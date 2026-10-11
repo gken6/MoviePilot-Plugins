@@ -1,6 +1,7 @@
 """豆瓣账号自动续登：只有明确过期才重新登录，网络异常不触发登录风暴。"""
 from __future__ import annotations
 
+import base64
 import hashlib
 import threading
 import time
@@ -64,8 +65,14 @@ def _qr_login(context, page, on_qr, should_continue) -> dict:
     if not isinstance(body, dict) or body.get("status") != "success" or not isinstance(payload, dict) or not payload.get("code") or not _qr_image_url(image):
         return {"status": "登录失败", "message": "豆瓣未提供可用登录二维码，下次同步时重试"}
     page.wait_for_selector(".account-qr-scan img", timeout=15000)
+    source = page.locator(".account-qr-scan img").get_attribute("src") or ""
+    if not isinstance(source, str) or not source.startswith("data:image/png;base64,") or len(source) > 3 * 1024 * 1024:
+        return {"status": "登录失败", "message": "豆瓣登录页未生成可用二维码图片，下次同步时重试"}
+    png = base64.b64decode(source.split(",", 1)[1], validate=True)
+    if not png.startswith(b"\x89PNG\r\n\x1a\n"):
+        return {"status": "登录失败", "message": "豆瓣登录二维码图片格式异常"}
     expires_at = time.time() + 360  # 与官方页面 120 次、每 3 秒轮询的上限一致。
-    if not should_continue() or on_qr(image, expires_at) is False:
+    if not should_continue() or on_qr(image, expires_at, png) is False:
         return {"status": "登录取消", "message": "扫码登录已取消"}
     while time.time() < expires_at:
         if not should_continue():
@@ -159,7 +166,7 @@ class AutomaticLogin:
         if not self._douban_username or not self._douban_password:
             return {"status": "未配置账号", "message": "请填写豆瓣账号和密码后保存"}
         record = self._auth_record()
-        public = {key: record.get(key) for key in ("status", "message", "last_login", "checked_at", "next_attempt", "qr_expires_at")
+        public = {key: record.get(key) for key in ("status", "message", "last_login", "checked_at", "next_attempt", "qr_expires_at", "notification_result")
                   if record.get(key) is not None} or {"status": "等待同步触发"}
         qr = getattr(self, "_login_qr", None)
         if qr and qr["key"] == self._credential_key and qr["expires_at"] > time.time() and self._auth_ready():
@@ -170,19 +177,28 @@ class AutomaticLogin:
             public.update(status="扫码已结束", message="扫码会话已结束，请在下一次同步或失败重试时重新获取二维码")
         return public
 
-    def _notify_login_qr(self, image: str, expires_at: float, key: str) -> bool:
+    def _notify_login_qr(self, image: str, expires_at: float, key: str, png: bytes | None = None) -> bool:
         if not self._auth_ready() or key != self._credential_key:
             return False
-        self._login_qr = {"key": key, "image": image, "expires_at": expires_at}
+        self._login_qr = {"key": key, "image": ("data:image/png;base64," + base64.b64encode(png).decode()) if png else image, "expires_at": expires_at}
         message = "账号登录未成功，请打开豆瓣 App 扫描登录二维码，并在手机上确认。二维码最多有效 6 分钟，确认后继续同步。"
         self.save_data(AUTH_DATA, {"credential_key": key, "status": "等待扫码", "message": message,
                                   "qr_expires_at": expires_at, "next_attempt": 0})
+        result = {}
         try:
-            from app.schemas.types import MessageType
-            self.post_message(mtype=MessageType.Plugin, title="豆瓣观看同步：请扫码登录", text=message, image=image, link=image)
+            from .qrnotify import send_qr_notifications
+            result = send_qr_notifications(self, image, message, qr_png=png)
+            if not self._auth_ready() or key != self._credential_key:
+                return False
+            self.save_data(AUTH_DATA, {"credential_key": key, "status": "等待扫码", "message": message,
+                                      "qr_expires_at": expires_at, "next_attempt": 0, "notification_result": result})
+            if not result.get("sent") or result.get("failed"):
+                raise RuntimeError("二维码图片通知未全部成功")
         except Exception:
-            self.save_data(AUTH_DATA, {"credential_key": key, "status": "等待扫码", "message": "二维码通知提交失败，请打开插件的豆瓣登录设置扫码确认",
-                                      "qr_expires_at": expires_at, "next_attempt": 0})
+            if not self._auth_ready() or key != self._credential_key:
+                return False
+            self.save_data(AUTH_DATA, {"credential_key": key, "status": "等待扫码", "message": "二维码图片发送失败，请打开插件的豆瓣登录设置扫码确认",
+                                      "qr_expires_at": expires_at, "next_attempt": 0, "notification_result": result})
             logger.warn("豆瓣登录二维码通知提交失败，可在插件设置中查看二维码")
         return True
 
@@ -213,10 +229,6 @@ class AutomaticLogin:
                 client.last_error = "自动续登需要启用插件并填写豆瓣账号密码"
                 return False
             record = self._auth_record()
-            # 另一个同步任务已经换了 Cookie，复用而不是再次登录。
-            if record.get("cookie") and client._parse_cookie(record["cookie"]) != client.cookies:
-                self._install_login(client, record)
-                return True
             if float(record.get("next_attempt") or 0) > time.time():
                 client.last_error = record.get("message") or "豆瓣登录失败，冷却结束后在下次同步时重试"
                 return False
@@ -225,7 +237,7 @@ class AutomaticLogin:
             self._login_active_key = key
             try:
                 result = browser_login(username, password,
-                                       on_qr=lambda image, expiry: self._notify_login_qr(image, expiry, key),
+                                       on_qr=lambda image, expiry, png=None: self._notify_login_qr(image, expiry, key, png),
                                        should_continue=lambda: self._auth_ready() and key == self._credential_key)
             except Exception:
                 result = {"status": "登录失败", "message": "登录流程未完成，请稍后重试"}
@@ -244,29 +256,57 @@ class AutomaticLogin:
         client._ck = client.cookies.get("ck") or ""
         client.user_agent = record.get("user_agent") or ""
 
-    def _prepare_login(self, client, force: bool = False) -> bool:
-        if not self._auto_login:
-            return True
-        if not self._auth_ready():
-            client.last_error = "自动续登需要启用插件并填写豆瓣账号密码"
+    def _remember_cookie(self, client, key: str, valid: bool | None) -> bool:
+        if not self._enabled or key != self._credential_key:
+            client.last_error = "配置已改变或插件已停用，请重新同步"
             return False
+        record = self._auth_record()
+        self.save_data(AUTH_DATA, {**record, "credential_key": key,
+                                  "cookie": client.cookie_header(), "user_agent": client.user_agent,
+                                  "status": "登录正常" if valid else "检查失败",
+                                  "message": "" if valid else "暂时无法检查豆瓣登录态，下次同步时再检查",
+                                  "checked_at": time.time() if valid else 0,
+                                  "next_attempt": 0 if valid else record.get("next_attempt", 0)})
+        return True
+
+    def _prepare_login(self, client, force: bool = False, rejected_cookie: str = "") -> bool:
+        """实际写入时按本地、CookieCloud、账号登录的顺序选择登录态。"""
         with self._login_lock:
+            if not self._enabled:
+                client.last_error = "插件已停用"
+                return False
+            key = self._credential_key
             record = self._auth_record()
-            if record.get("cookie") or client.cookies:
-                if record.get("cookie"):
-                    self._install_login(client, record)
-                if not force and record.get("status") == "登录正常" and time.time() - float(record.get("checked_at") or 0) < 600:
+            rejected = client._parse_cookie(rejected_cookie)
+            local = record.get("cookie") or client.cookie_header() or self._load_cookie()
+            self._install_login(client, {"cookie": local, "user_agent": record.get("user_agent") or client.user_agent})
+            tried = [rejected] if rejected else []
+            if client.cookies and client.cookies not in tried:
+                tried.append(dict(client.cookies))
+                if not force and record.get("cookie") and record.get("status") == "登录正常" and time.time() - float(record.get("checked_at") or 0) < 600:
                     return True
                 valid = client.login_state()
-                if valid is True:
-                    self.save_data(AUTH_DATA, {**record, "credential_key": self._credential_key,
-                                              "cookie": client.cookie_header(), "user_agent": client.user_agent,
-                                              "status": "登录正常", "message": "", "checked_at": time.time()})
-                    return True
-                if valid is None:
-                    # 检测异常保留 Cookie；仅写入本身的成功响应才归档。
-                    self.save_data(AUTH_DATA, {**record, "status": "检查失败", "message": "暂时无法检查豆瓣登录态，下次同步时再检查"})
-                    return True
+                if valid is not False:
+                    # 网络/风控异常不等于失效；仍由实际写入的响应决定是否归档。
+                    return self._remember_cookie(client, key, valid)
+            if not self._enabled or key != self._credential_key:
+                client.last_error = "配置已改变或插件已停用，请重新同步"
+                return False
+            if record.get("cookie"):
+                self.save_data(AUTH_DATA, {**record, "status": "登录失效", "checked_at": 0})
+            if self._use_cookiecloud:
+                cookie = self._load_cookiecloud()
+                self._install_login(client, {"cookie": cookie})
+                if client.cookies and client.cookies not in tried:
+                    valid = client.login_state()
+                    if valid is not False:
+                        return self._remember_cookie(client, key, valid)
+            if not self._enabled or key != self._credential_key:
+                client.last_error = "配置已改变或插件已停用，请重新同步"
+                return False
+            if not self._auth_ready():
+                client.last_error = "豆瓣 Cookie 为空或已失效；请启用 CookieCloud 或配置账号自动续登"
+                return False
             return self._renew_login(client)
 
     def _write_douban(self, client, method: str, *args, **kwargs) -> bool:
@@ -274,8 +314,8 @@ class AutomaticLogin:
             return False
         if getattr(client, method)(*args, **kwargs):
             return True
-        if self._auto_login and client.login_state() is False and self._renew_login(client):
-            # 重登后只重试本次操作一次，不重复更新本地档案。
+        if client.login_state() is False and self._prepare_login(client, force=True, rejected_cookie=client.cookie_header()):
+            # 切换登录态后只重试本次操作一次，不重复更新本地档案。
             return bool(getattr(client, method)(*args, **kwargs))
         return False
 

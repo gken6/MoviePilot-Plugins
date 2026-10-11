@@ -409,7 +409,7 @@ class WatchManagement:
         try:
             client = DoubanClient(cookie=self._load_cookie() if operation["action"] == "sync" or operation["cleanup_ids"] else "")
             needs_login = operation["action"] == "sync" or bool(operation["cleanup_ids"])
-            if needs_login and not client.has_login() and not self._auto_login:
+            if needs_login and not client.has_login() and not self._auto_login and not self._use_cookiecloud:
                 message = "豆瓣登录态不可用，请检查 Cookie 或 CookieCloud"
             else:
                 if operation["action"] == "sync" and not operation.get("new_synced"):
