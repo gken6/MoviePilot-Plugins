@@ -179,7 +179,7 @@ class AutomaticLogin:
                                   "qr_expires_at": expires_at, "next_attempt": 0})
         try:
             from app.schemas.types import MessageType
-            self.post_message(mtype=MessageType.Plugin, title="豆瓣观看同步：请扫码登录", text=message, image=image)
+            self.post_message(mtype=MessageType.Plugin, title="豆瓣观看同步：请扫码登录", text=message, image=image, link=image)
         except Exception:
             self.save_data(AUTH_DATA, {"credential_key": key, "status": "等待扫码", "message": "二维码通知提交失败，请打开插件的豆瓣登录设置扫码确认",
                                       "qr_expires_at": expires_at, "next_attempt": 0})

@@ -742,6 +742,7 @@ def test_qr_notification_uses_mp_and_exposes_only_active_image(runtime):
     assert plugin._notify_login_qr(image, time.time() + 360, plugin._credential_key)
     plugin.post_message.assert_called_once()
     assert plugin.post_message.call_args.kwargs['image'] == image
+    assert plugin.post_message.call_args.kwargs['link'] == image
     assert plugin._auth_public()['status'] == '等待扫码'
     assert plugin._auth_public()['qr_image'] == image
     assert 'qr_image' not in plugin.get_data(auth.AUTH_DATA)
