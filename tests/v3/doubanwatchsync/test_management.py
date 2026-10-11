@@ -9,7 +9,8 @@ from unittest.mock import Mock
 
 import pytest
 
-ROOT = Path(os.environ.get("WATCHSYNC_TEST_ROOT", Path(__file__).resolve().parents[3] / 'plugins.v3' / 'doubanwatchsync'))
+ROOT = (Path(os.environ["WATCHSYNC_TEST_ROOT"]) if os.environ.get("WATCHSYNC_TEST_ROOT")
+        else Path(__file__).resolve().parents[3] / 'plugins.v3' / 'doubanwatchsync')
 
 
 @pytest.fixture
