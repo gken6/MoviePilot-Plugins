@@ -805,7 +805,7 @@ def test_invalid_or_uncertain_model_coordinates_are_rejected(runtime, changes):
 def test_only_captcha_frame_is_captured_and_input_fields_are_hidden(runtime):
     slider = slider_module(runtime)
     box = dict(x=100, y=100, width=360, height=360)
-    frame = Mock(url='https://turing.captcha.qcloud.com/cap_union_new_show')
+    frame = Mock(url='https://turing.captcha.gtimg.com/cap_union_new_show')
     element = Mock(); element.bounding_box.return_value = box
     element.screenshot.return_value = b'\x89PNG\r\n\x1a\nimage'
     frame.frame_element.return_value = element; frame.inner_text.return_value = '拖动下方滑块完成拼图'
@@ -908,3 +908,16 @@ def test_one_drag_is_not_treated_as_success_without_official_login_response(runt
     page.mouse.down.assert_called_once(); page.mouse.up.assert_called_once()
     assert page.mouse.move.call_count == 2
     page.expect_response.assert_called_once()
+
+
+def test_model_runs_in_separate_thread_when_browser_event_loop_is_running(runtime, monkeypatch):
+    import asyncio, threading
+    slider, page = fake_slider_attempt(runtime, monkeypatch)
+    original_thread = threading.get_ident()
+    async def identify(image):
+        assert threading.get_ident() != original_thread
+        return slider_answer()
+    monkeypatch.setattr(slider, 'identify_drag', identify)
+    async def run(): return slider.attempt_slider(page)
+    assert asyncio.run(run())['status'] == '验证通过'
+    page.mouse.down.assert_called_once()

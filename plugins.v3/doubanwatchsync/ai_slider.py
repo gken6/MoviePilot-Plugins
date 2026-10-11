@@ -5,6 +5,7 @@ import asyncio
 import base64
 import json
 import math
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from urllib.parse import urlsplit
 
 
@@ -16,7 +17,7 @@ def _trusted_frame(url: str) -> bool:
     parsed = urlsplit(url)
     host = parsed.hostname or ""
     return parsed.scheme == "https" and (
-        host in {"captcha.qq.com", "captcha.gtimg.com", "turing.captcha.qcloud.com"}
+        host in {"captcha.qq.com", "captcha.gtimg.com", "turing.captcha.gtimg.com", "turing.captcha.qcloud.com"}
         or host.endswith(".captcha.qq.com")
     )
 
@@ -111,8 +112,12 @@ async def identify_drag(image: bytes) -> str:
         return LLMHelper.extract_text_content(response.content)
     except SliderUnavailable:
         raise
-    except Exception:
-        raise SliderUnavailable("无法调用 MP 智能助手识别滑块，续登暂停") from None
+    except (TimeoutError, asyncio.TimeoutError):
+        raise SliderUnavailable("MP 智能助手调用超时，续登暂停") from None
+    except Exception as error:
+        status = getattr(error, "status_code", None)
+        detail = f"（HTTP {status}）" if isinstance(status, int) and 400 <= status < 600 else ""
+        raise SliderUnavailable("无法调用 MP 智能助手识别滑块" + detail + "，续登暂停") from None
     finally:
         if model is not None:
             try:
@@ -125,12 +130,17 @@ def attempt_slider(page) -> dict:
     """只尝试一次；必须收到豆瓣原登录接口的成功响应，再由调用方确认 Cookie。"""
     try:
         frame, element, box, image = capture_challenge(page)
+        # Playwright 的同步接口本身使用运行中的事件循环；在独立线程内
+        # 完成模型异步调用，浏览器对象仍只在原线程使用。
+        pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="douban-slider-ai")
         try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            text = asyncio.run(identify_drag(image))
-        else:
-            raise SliderUnavailable("当前任务环境不支持同步浏览器验证，续登暂停")
+            future = pool.submit(lambda: asyncio.run(identify_drag(image)))
+            try:
+                text = future.result(timeout=50)
+            except FutureTimeout:
+                raise SliderUnavailable("MP 智能助手调用超时，未提交拖动") from None
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
         start, end = parse_drag(text, box)
         latest = element.bounding_box()
         if not _trusted_frame(frame.url) or not _box_valid(latest) or any(
