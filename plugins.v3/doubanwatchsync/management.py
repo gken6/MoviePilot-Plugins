@@ -102,7 +102,7 @@ class WatchManagement:
                                "target_status": (operation.get("record") or {}).get("status", "")})
             return sorted(result, key=lambda row: row.get("timestamp", ""), reverse=True)
         return {"servers": servers, "archive": rows(archive), "pending": rows(pending),
-                "unmatched": rows(ignored), "enabled": self._enabled}
+                "unmatched": rows(ignored), "enabled": self._enabled, "login": self._auth_public()}
 
     @staticmethod
     def _public_server(item: dict) -> dict:
@@ -388,7 +388,8 @@ class WatchManagement:
         message = ""
         try:
             client = DoubanClient(cookie=self._load_cookie() if operation["action"] == "sync" or operation["cleanup_ids"] else "")
-            if not client.has_login() and (operation["action"] == "sync" or operation["cleanup_ids"]):
+            needs_login = operation["action"] == "sync" or bool(operation["cleanup_ids"])
+            if needs_login and not client.has_login() and not self._auto_login:
                 message = "豆瓣登录态不可用，请检查 Cookie 或 CookieCloud"
             else:
                 if operation["action"] == "sync" and not operation.get("new_synced"):
@@ -398,7 +399,7 @@ class WatchManagement:
                     detail = client.get_subject_info(subject, media_type)
                     if not detail:
                         message = "无法读取该豆瓣条目，请核对编号或稍后重试"
-                    elif client.set_status(subject, record.get("status") or "do", self._private):
+                    elif self._write_douban(client, "set_status", subject, record.get("status") or "do", self._private):
                         payload = {"episode": record.get("episode", 0), "item_id": record.get("item_id", ""),
                                    "server_name": record.get("server_name", ""), "user_name": record.get("user_name", ""),
                                    "title": record.get("source_title") or record.get("title") or "", "direct_id": record.get("direct_id") or ""}
@@ -420,7 +421,7 @@ class WatchManagement:
                         if self._subject_used_elsewhere(subject, key):
                             operation["cleanup_ids"].remove(subject)
                             continue
-                        if client.remove_status(subject):
+                        if self._write_douban(client, "remove_status", subject):
                             operation["cleanup_ids"].remove(subject)
                         else:
                             message = "新条目已同步，旧标记待撤销" if operation["action"] == "sync" else "已停止匹配，旧豆瓣标记待撤销"

@@ -40,12 +40,40 @@ class DoubanClient:
         self.cookies: Dict[str, str] = self._parse_cookie(cookie)
         self._ck = self.cookies.get("ck") or ""
         self.last_error = ""
+        self.user_agent = ""
 
     # ---------------- 对外能力 ----------------
 
     def has_login(self) -> bool:
         """判断当前是否具备写入豆瓣的登录态。"""
         return bool(self.cookies)
+
+    def login_state(self) -> Optional[bool]:
+        """只读检查电影站登录态；None 表示网络/风控异常，不能据此认定过期。"""
+        if not self.cookies.get("dbcl2"):
+            return False
+        try:
+            from bs4 import BeautifulSoup
+            from urllib.parse import urlsplit
+            response = RequestUtils(headers=self._build_base_headers(), timeout=self._timeout).get_res(
+                "https://movie.douban.com/")
+            if response is None:
+                return None
+            if response.status_code == 401:
+                return False
+            if response.status_code != 200:
+                return None
+            address = str(getattr(response, "url", "") or "")
+            if address and urlsplit(address).hostname == "accounts.douban.com" and "/passport/login" in urlsplit(address).path:
+                return False
+            soup = BeautifulSoup(response.text, "html.parser")
+            if soup.select_one("#db-global-nav .nav-user-account"):
+                return True
+            if soup.select_one('#db-global-nav a[href*="accounts.douban.com/passport/login"]'):
+                return False
+        except Exception:
+            pass
+        return None
 
     def search(self, title: str, media_type: str = "TV") -> Tuple[Optional[str], Optional[str]]:
         """
@@ -329,7 +357,7 @@ class DoubanClient:
     def _build_base_headers(self) -> Dict[str, str]:
         """构造豆瓣通用请求头。"""
         return {
-            "User-Agent": _USER_AGENT,
+            "User-Agent": self.user_agent or _USER_AGENT,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "zh-CN,zh;q=0.9",
             "Connection": "keep-alive",

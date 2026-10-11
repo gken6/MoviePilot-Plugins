@@ -126,6 +126,7 @@ export const Config = defineComponent({
   setup(props, { emit }) {
     const model = reactive({ ...(props.initialConfig || {}) });
     const rows = ref([]), error = ref(''), saving = ref(false);
+    const login = useManagement(props);
     onMounted(async () => {
       emit('layout', { maxWidth: '76rem' });
       try {
@@ -149,6 +150,17 @@ export const Config = defineComponent({
       h('div', { class: 'dw-config-body' }, [
         h('section', { class: 'dw-native' }, [h('h3', 'MoviePilot 媒体服务器'), ...rows.value.slice(0, 4).map(row => renderNative(row, model))]),
         h(ServerManager, { api: props.api, pluginId: props.pluginId }),
+        h('section', { class: 'dw-native dw-settings' }, [h('h3', '豆瓣自动续登'),
+          ...rows.value.slice(11, 12).map(row => renderNative(row, model)),
+          ...(model.auto_login ? rows.value.slice(12).map(row => renderNative(row, model)) : []),
+          h('p', { class: 'dw-subtle' }, model.auto_login ? '实际同步时检查登录态，Cookie 过期后自动重新获取并重试当前同步。账号密码保存在 NAS 的插件配置中。' : '关闭时沿用上方手填 Cookie 或 CookieCloud；开启后在同步时用豆瓣账号续期失效 Cookie。'),
+          h('div', { class: 'dw-notice', role: 'status', 'aria-live': 'polite' }, [
+            h('strong', login.data.value.login?.status || '读取登录状态…'),
+            login.data.value.login?.message ? h('p', login.data.value.login.message) : null,
+            login.data.value.login?.last_login ? h('small', `上次自动登录：${new Date(login.data.value.login.last_login * 1000).toLocaleString()}`) : null,
+            login.data.value.login?.next_attempt ? h('small', ` · 重试冷却至：${new Date(login.data.value.login.next_attempt * 1000).toLocaleString()}`) : null,
+          ]),
+        ]),
         h('section', { class: 'dw-native dw-settings' }, [h('h3', '同步与显示设置'), ...rows.value.slice(6, 10).map(row => renderNative(row, model))]),
         error.value ? h('div', { role: 'alert', class: 'dw-notice dw-error' }, error.value) : null,
       ]),

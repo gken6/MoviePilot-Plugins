@@ -63,7 +63,7 @@ def runtime(monkeypatch):
     spec = importlib.util.spec_from_file_location(name, ROOT / '__init__.py', submodule_search_locations=[str(ROOT)])
     plugin_module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, name, plugin_module)
-    for suffix in ('doubanclient', 'mediaserver', 'management'):
+    for suffix in ('doubanclient', 'mediaserver', 'management', 'auth'):
         monkeypatch.setitem(sys.modules, name + '.' + suffix, None)
         sys.modules.pop(name + '.' + suffix)
     spec.loader.exec_module(plugin_module)
@@ -499,3 +499,219 @@ def test_management_api_requires_administrator(runtime):
         management.require_manager(types.SimpleNamespace(super_user=False))
     assert error.value.status_code == 403
     assert all(item['dependencies'] for item in plugin.management_api())
+
+
+def enable_auto(runtime):
+    plugin, _, module, _ = runtime
+    plugin.init_plugin({'enabled': True, 'auto_login': True, 'douban_username': 'account@example.test',
+                        'douban_password': 'simulated-password'})
+    return plugin, sys.modules[module.__name__ + '.auth'], sys.modules[module.__name__ + '.doubanclient']
+
+
+def login_client(client_module, cookie='dbcl2=expired; ck=old'):
+    client = client_module.DoubanClient(cookie=cookie)
+    client.login_state = Mock(return_value=False)
+    client.set_status = Mock(return_value=True)
+    client.remove_status = Mock(return_value=True)
+    return client
+
+
+def good_login():
+    return {'status': '登录正常', 'cookie': 'dbcl2=fresh; ck=new', 'user_agent': 'browser-test-agent'}
+
+
+def test_auto_login_has_no_timer_or_initial_login(runtime):
+    plugin, auth, _ = enable_auto(runtime)
+    assert not any('login' in job[0] for job in runtime[3])
+    assert [item['id'] for item in plugin.get_service()] == ['DoubanWatchSync.Retry', 'DoubanWatchSync.PollPlaying']
+    assert plugin._auth_public()['status'] == '等待同步触发'
+    assert auth.AUTH_DATA not in plugin.data
+
+
+def test_valid_initial_cookie_is_reused_without_login(runtime, monkeypatch):
+    plugin, auth, cm = enable_auto(runtime)
+    browser = Mock(side_effect=AssertionError('should not log in'))
+    monkeypatch.setattr(auth, 'browser_login', browser)
+    client = login_client(cm); client.login_state.return_value = True
+    assert plugin._write_douban(client, 'set_status', '200', 'collect', True)
+    browser.assert_not_called()
+    assert plugin.data[auth.AUTH_DATA]['cookie'] == client.cookie_header()
+    assert 'last_login' not in plugin.data[auth.AUTH_DATA]
+
+
+def test_expired_cookie_renews_only_on_write_and_saves_new_cookie(runtime, monkeypatch):
+    plugin, auth, cm = enable_auto(runtime)
+    browser = Mock(return_value=good_login()); monkeypatch.setattr(auth, 'browser_login', browser)
+    client = login_client(cm)
+    assert plugin._write_douban(client, 'set_status', '200', 'collect', True)
+    browser.assert_called_once()
+    assert client.cookies == {'dbcl2': 'fresh', 'ck': 'new'}
+    assert client._build_base_headers()['User-Agent'] == 'browser-test-agent'
+    client.set_status.assert_called_once_with('200', 'collect', True)
+    report = plugin.api_management()['login']
+    assert report['status'] == '登录正常'
+    assert not {'cookie', 'credential_key', 'user_agent', 'password'} & report.keys()
+    assert 'simulated-password' not in str(report)
+    assert 'fresh' not in str(report)
+    plugin._cookie = 'dbcl2=expired; ck=old'
+    plugin._load_cookie = types.MethodType(runtime[2].DoubanWatchSync._load_cookie, plugin)
+    assert 'fresh' in plugin._load_cookie()  # Old hand-filled cookie cannot override renewed one.
+
+
+def test_write_detects_sudden_expiry_and_retries_once(runtime, monkeypatch):
+    import time
+    plugin, auth, cm = enable_auto(runtime)
+    client = login_client(cm)
+    plugin.save_data(auth.AUTH_DATA, {'credential_key': plugin._credential_key, 'cookie': client.cookie_header(),
+                                    'status': '登录正常', 'checked_at': time.time()})
+    browser = Mock(return_value=good_login()); monkeypatch.setattr(auth, 'browser_login', browser)
+    client.set_status.side_effect = [False, True]
+    assert plugin._write_douban(client, 'set_status', '200', 'collect', True)
+    assert client.set_status.call_count == 2
+    browser.assert_called_once()
+
+
+def test_write_failure_after_successful_login_stays_failure(runtime, monkeypatch):
+    plugin, auth, cm = enable_auto(runtime)
+    monkeypatch.setattr(auth, 'browser_login', Mock(return_value=good_login()))
+    client = login_client(cm)
+    client.login_state.side_effect = lambda: client.cookies.get('dbcl2') == 'fresh'
+    client.set_status.return_value = False
+    assert not plugin._write_douban(client, 'set_status', '200', 'collect', True)
+    client.set_status.assert_called_once()
+    assert plugin.get_data('archive') is None
+
+
+def test_network_problem_is_not_cookie_expiry(runtime, monkeypatch):
+    plugin, auth, cm = enable_auto(runtime)
+    browser = Mock(side_effect=AssertionError('should not log in')); monkeypatch.setattr(auth, 'browser_login', browser)
+    client = login_client(cm); client.login_state.return_value = None; client.set_status.return_value = False
+    assert not plugin._write_douban(client, 'set_status', '200', 'collect', True)
+    browser.assert_not_called()
+
+
+def test_challenge_cools_down_and_keeps_history(runtime, monkeypatch):
+    import time
+    plugin, auth, cm = enable_auto(runtime)
+    key = archive_record(plugin)
+    before = copy.deepcopy(plugin.data['archive'])
+    browser = Mock(return_value={'status': '需要验证', 'message': '豆瓣要求安全验证'})
+    monkeypatch.setattr(auth, 'browser_login', browser)
+    for _ in range(3):
+        client = login_client(cm)
+        assert not plugin._write_douban(client, 'set_status', '200', 'collect', True)
+        client.set_status.assert_not_called()
+    browser.assert_called_once()
+    assert plugin.data['archive'] == before
+    assert plugin._auth_public()['next_attempt'] > time.time() + 21000
+    assert key in plugin.data['archive']
+
+
+def test_disabled_auto_login_never_uses_browser(runtime, monkeypatch):
+    plugin, auth, cm = enable_auto(runtime)
+    plugin._auto_login = False
+    browser = Mock(side_effect=AssertionError('disabled')); monkeypatch.setattr(auth, 'browser_login', browser)
+    client = login_client(cm)
+    assert plugin._write_douban(client, 'set_status', '200', 'collect', True)
+    client.login_state.assert_not_called(); browser.assert_not_called()
+
+
+def test_late_login_cannot_save_cookie_after_account_change(runtime, monkeypatch):
+    plugin, auth, cm = enable_auto(runtime)
+    def login(*_):
+        plugin._auth_init({'auto_login': True, 'douban_username': 'new@example.test', 'douban_password': 'new-secret'})
+        return good_login()
+    monkeypatch.setattr(auth, 'browser_login', login)
+    client = login_client(cm)
+    assert not plugin._write_douban(client, 'set_status', '200', 'collect', True)
+    assert not plugin._auth_record().get('cookie')
+    client.set_status.assert_not_called()
+
+
+def test_concurrent_sync_uses_one_login(runtime, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    plugin, auth, cm = enable_auto(runtime)
+    browser = Mock(return_value=good_login()); monkeypatch.setattr(auth, 'browser_login', browser)
+    clients = [login_client(cm) for _ in range(4)]
+    for client in clients:
+        client.login_state.side_effect = lambda c=client: c.cookies.get('dbcl2') == 'fresh'
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        assert all(pool.map(lambda c: plugin._write_douban(c, 'set_status', '200', 'collect', True), clients))
+    browser.assert_called_once()
+
+
+@pytest.mark.parametrize('http,html,expected', [
+    (200, '<div id="db-global-nav"><div class="nav-user-account">账号</div></div>', True),
+    (200, '<div id="db-global-nav"><a href="https://accounts.douban.com/passport/login">登录</a></div>', False),
+    (200, '<h1>暂时无法访问</h1>', None), (403, '', None), (418, '', None), (401, '', False)])
+def test_login_check_distinguishes_expiry_from_network(runtime, monkeypatch, http, html, expected):
+    cm = sys.modules[runtime[2].__name__ + '.doubanclient']
+    client = cm.DoubanClient(cookie='dbcl2=simulated; ck=simulated')
+    monkeypatch.setattr(cm, 'RequestUtils', Mock(return_value=Mock(get_res=Mock(return_value=types.SimpleNamespace(
+        status_code=http, text=html, url='https://movie.douban.com/')))))
+    assert client.login_state() is expected
+
+
+def browser_stub(monkeypatch, *, success=False, text='账号密码错误', changed_url=None):
+    page = Mock()
+    page.url = 'https://accounts.douban.com/passport/login'
+    page.inner_text.return_value = text
+    page.evaluate.return_value = 'browser-agent'
+    page.query_selector.return_value = object() if success else None
+    def goto(url, **kwargs):
+        page.url = changed_url or url
+    page.goto.side_effect = goto
+    context = Mock(new_page=Mock(return_value=page))
+    context.cookies.return_value = ([{'name': 'dbcl2', 'value': 'fresh', 'domain': '.douban.com', 'path': '/'},
+                                     {'name': 'ck', 'value': 'fresh-ck', 'domain': '.douban.com', 'path': '/'},
+                                     {'name': 'alien', 'value': 'exclude', 'domain': '.example.test', 'path': '/'}] if success else [])
+    browser_module = types.ModuleType('app.sdk.browser')
+    browser_module.launch_browser_context = Mock(return_value=context)
+    monkeypatch.setitem(sys.modules, 'app.sdk.browser', browser_module)
+    return context, page
+
+
+def test_browser_login_success_closes_context_and_filters_domains(runtime, monkeypatch):
+    auth = sys.modules[runtime[2].__name__ + '.auth']
+    context, page = browser_stub(monkeypatch, success=True)
+    result = auth.browser_login('test-user', 'test-password')
+    assert result['status'] == '登录正常'
+    assert 'alien' not in result['cookie'] and 'exclude' not in result['cookie']
+    page.fill.assert_any_call('input[name="password"]', 'test-password')
+    context.close.assert_called_once()
+
+
+def test_browser_login_challenge_is_not_solved(runtime, monkeypatch):
+    auth = sys.modules[runtime[2].__name__ + '.auth']
+    context, page = browser_stub(monkeypatch, text='请完成安全验证')
+    result = auth.browser_login('test-user', 'test-password')
+    assert result['status'] == '需要验证' and 'cookie' not in result
+    assert page.click.call_args_list == [((".account-tab-account",),), ((".account-form-field-submit .btn-account",),)]
+    context.close.assert_called_once()
+
+
+def test_browser_never_submits_password_to_redirected_site(runtime, monkeypatch):
+    auth = sys.modules[runtime[2].__name__ + '.auth']
+    context, page = browser_stub(monkeypatch, changed_url='https://example.test/')
+    assert auth.browser_login('test-user', 'test-password')['status'] == '登录失败'
+    page.fill.assert_not_called(); context.close.assert_called_once()
+
+
+def test_browser_exception_does_not_leak_password(runtime, monkeypatch):
+    auth = sys.modules[runtime[2].__name__ + '.auth']
+    context, page = browser_stub(monkeypatch)
+    page.fill.side_effect = RuntimeError('simulated-password')
+    result = auth.browser_login('test-user', 'simulated-password')
+    assert result['status'] == '登录失败' and 'simulated-password' not in str(result)
+    context.close.assert_called_once()
+
+
+def test_account_change_does_not_reuse_old_manual_cookie(runtime):
+    plugin, auth, _ = enable_auto(runtime)
+    plugin.save_data(auth.AUTH_DATA, {'credential_key': plugin._credential_key, **good_login()})
+    plugin._auth_init({'auto_login': True, 'douban_username': 'other@example.test', 'douban_password': 'other-secret'})
+    plugin._cookie = 'dbcl2=old-user; ck=old'
+    plugin._download_cookiecloud_cookies = Mock(side_effect=AssertionError('old CookieCloud should not be used'))
+    plugin._load_cookie = types.MethodType(runtime[2].DoubanWatchSync._load_cookie, plugin)
+    assert plugin._load_cookie() == ''
+    plugin._download_cookiecloud_cookies.assert_not_called()

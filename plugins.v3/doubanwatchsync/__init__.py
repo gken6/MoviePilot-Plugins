@@ -28,10 +28,12 @@ from app.sdk.services import MediaServerHelper
 from app.sdk import scheduler as scheduler_sdk
 
 try:  # 包内相对导入，兼容宿主重建实例的命名空间
+    from .auth import AutomaticLogin
     from .doubanclient import DoubanClient
     from .management import WatchManagement
     from .mediaserver import MediaServerReader
 except Exception:  # pragma: no cover - 极端加载路径兜底
+    from app.plugins.doubanwatchsync.auth import AutomaticLogin
     from app.plugins.doubanwatchsync.doubanclient import DoubanClient
     from app.plugins.doubanwatchsync.management import WatchManagement
     from app.plugins.doubanwatchsync.mediaserver import MediaServerReader
@@ -64,14 +66,14 @@ _KEY_POLL = "poll"
 _IMAGE_CACHE_MAX = 200
 
 
-class DoubanWatchSync(WatchManagement, _PluginBase):
+class DoubanWatchSync(AutomaticLogin, WatchManagement, _PluginBase):
     """把剧集/电影的观看进度写入豆瓣书影音档案。"""
 
     # 插件基本信息
     plugin_name = "豆瓣观看同步"
     plugin_desc = "将在看、看完状态同步到豆瓣书影音档案；支持多媒体服务器路由、独立档案与重试队列。"
     plugin_icon = "https://raw.githubusercontent.com/gken6/MoviePilot-Plugins/main/icons/doubanwatchsync.svg"
-    plugin_version = "2.0.3"
+    plugin_version = "2.1.0"
     plugin_author = "gken6"
     author_url = "https://github.com/gken6"
     plugin_config_prefix = "doubanwatchsync_"
@@ -144,6 +146,7 @@ class DoubanWatchSync(WatchManagement, _PluginBase):
         self._inline_image = bool(config.get("inline_image", True))
         self._inline_limit = self._to_int(config.get("inline_limit"), 20, 1)
 
+        self._auth_init(config)
         self._management_init(config)
 
         if config.get("onlyonce"):
@@ -718,13 +721,13 @@ class DoubanWatchSync(WatchManagement, _PluginBase):
             return
 
         client = DoubanClient(cookie=self._load_cookie())
-        if not client.has_login():
+        if not client.has_login() and not self._auto_login:
             logger.error("豆瓣 cookie 为空，无法同步，请配置 cookie 或 CookieCloud")
             self._save_pending(key, payload, subject_name or title, season, media_type, status, subject_id)
             return
 
         display = self._display_title(subject_name or title, season)
-        if client.set_status(subject_id=subject_id, status=status, private=self._private):
+        if self._write_douban(client, "set_status", subject_id=subject_id, status=status, private=self._private):
             logger.info(f"{display} 同步到档案成功（{self._status_text(status)}）")
             # 海报优先用豆瓣官方竖版，取不到再退回媒体服务器的图
             image = client.get_subject_image(subject_id, media_type) or payload.get("image") or ""
@@ -756,7 +759,7 @@ class DoubanWatchSync(WatchManagement, _PluginBase):
 
         logger.info(f"开始重试豆瓣同步失败队列，共 {len(pending)} 条")
         client = DoubanClient(cookie=self._load_cookie())
-        if not client.has_login():
+        if not client.has_login() and not self._auto_login:
             logger.error("豆瓣 cookie 为空，跳过本次重试")
             return
 
@@ -784,7 +787,7 @@ class DoubanWatchSync(WatchManagement, _PluginBase):
                         continue
                     subject_id, record["subject_id"] = found, found
                     record["subject_name"] = subject_name
-                if client.set_status(subject_id=subject_id, status=status, private=self._private):
+                if self._write_douban(client, "set_status", subject_id=subject_id, status=status, private=self._private):
                     record["subject_id"] = subject_id
                     logger.info(f"{display} 重试同步成功")
                     self._move_pending_to_archive(key, record)
@@ -816,7 +819,7 @@ class DoubanWatchSync(WatchManagement, _PluginBase):
             return summary
 
         client = DoubanClient(cookie=self._load_cookie())
-        if not client.has_login():
+        if not client.has_login() and not self._auto_login:
             logger.error("豆瓣 cookie 为空，无法重扫档案")
             summary["failed"] = len(archive)
             return summary
@@ -903,7 +906,7 @@ class DoubanWatchSync(WatchManagement, _PluginBase):
                     summary["failed"] += 1
                     continue
 
-                if client.set_status(subject_id=subject_id, status="collect", private=self._private):
+                if self._write_douban(client, "set_status", subject_id=subject_id, status="collect", private=self._private):
                     step["result"] = "写入豆瓣成功，已升级为看过"
                     logger.info(f"{title} 第{season}季已看完，重扫后标记为看过")
                     updates[key] = record
@@ -1159,6 +1162,13 @@ class DoubanWatchSync(WatchManagement, _PluginBase):
         如果保留了旧配置中的独立 host/key/password，则只临时覆盖 helper 实例字段，
         不写回全局配置，也不记录敏感值。
         """
+        if self._auto_login:
+            current = str(self._auth_record().get("cookie") or "")
+            if current:
+                return current
+            # 更换账号后不回退到旧账号遗留的手填/云同步 Cookie。
+            if self.get_data("douban_login"):
+                return ""
         if self._cookie.strip():
             return self._cookie.strip()
         if not self._use_cookiecloud:
@@ -1855,6 +1865,23 @@ class DoubanWatchSync(WatchManagement, _PluginBase):
                             },
                         ],
                     },
+                    {
+                        "component": "VRow", "content": [
+                            {"component": "VCol", "props": {"cols": 12}, "content": [
+                                {"component": "VSwitch", "props": {"model": "auto_login", "label": "Cookie 过期自动重新登录"}},
+                            ]},
+                        ],
+                    },
+                    {
+                        "component": "VRow", "content": [
+                            {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                                {"component": "VTextField", "props": {"model": "douban_username", "label": "豆瓣账号", "placeholder": "手机号或邮箱", "autocomplete": "username"}},
+                            ]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                                {"component": "VTextField", "props": {"model": "douban_password", "label": "豆瓣密码", "type": "password", "autocomplete": "current-password"}},
+                            ]},
+                        ],
+                    },
                 ],
             }
         ], {
@@ -1868,6 +1895,9 @@ class DoubanWatchSync(WatchManagement, _PluginBase):
             "direct_poll_servers": [],
             "exclude": "",
             "cookie": "",
+            "auto_login": False,
+            "douban_username": "",
+            "douban_password": "",
             "use_cookiecloud": True,
             "cookiecloud_host": "",
             "cookiecloud_key": "",
