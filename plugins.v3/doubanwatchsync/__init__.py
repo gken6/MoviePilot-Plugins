@@ -73,7 +73,7 @@ class DoubanWatchSync(AutomaticLogin, WatchManagement, _PluginBase):
     plugin_name = "豆瓣观看同步"
     plugin_desc = "将在看、看完状态同步到豆瓣书影音档案；支持多媒体服务器路由、独立档案与重试队列。"
     plugin_icon = "https://raw.githubusercontent.com/gken6/MoviePilot-Plugins/main/icons/doubanwatchsync.svg"
-    plugin_version = "2.3.3"
+    plugin_version = "2.3.4"
     plugin_author = "gken6"
     author_url = "https://github.com/gken6"
     plugin_config_prefix = "doubanwatchsync_"
@@ -1145,13 +1145,10 @@ class DoubanWatchSync(AutomaticLogin, WatchManagement, _PluginBase):
 
     def _load_cookie(self) -> str:
         """只读取插件本地 Cookie；失效后在实际写入流程中读取 CookieCloud。"""
+        if self._cookie.strip():
+            return self._cookie.strip()
         current = str(self._auth_record().get("cookie") or "")
-        if current:
-            return current
-        saved = self.get_data("douban_login") or {}
-        if saved and saved.get("credential_key") != self._credential_key:
-            return ""  # 账号改变后不复用原账号遗留的手填 Cookie。
-        return self._cookie.strip()
+        return current
 
     def _load_cookiecloud(self) -> str:
         """复用宿主下载、解密和域名归并；关闭开关时不读取。"""

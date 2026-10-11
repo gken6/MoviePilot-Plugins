@@ -560,7 +560,7 @@ def test_expired_cookie_renews_only_on_write_and_saves_new_cookie(runtime, monke
     assert 'fresh' not in str(report)
     plugin._cookie = 'dbcl2=expired; ck=old'
     plugin._load_cookie = types.MethodType(runtime[2].DoubanWatchSync._load_cookie, plugin)
-    assert 'fresh' in plugin._load_cookie()  # Old hand-filled cookie cannot override renewed one.
+    assert plugin._load_cookie() == plugin._cookie  # Explicit hand-filled cookie now takes priority.
 
 
 def test_write_detects_sudden_expiry_and_retries_once(runtime, monkeypatch):
@@ -727,14 +727,14 @@ def test_browser_exception_does_not_leak_password(runtime, monkeypatch):
     context.close.assert_called_once()
 
 
-def test_account_change_does_not_reuse_old_manual_cookie(runtime):
+def test_account_change_keeps_explicit_manual_cookie_priority(runtime):
     plugin, auth, _ = enable_auto(runtime)
     plugin.save_data(auth.AUTH_DATA, {'credential_key': plugin._credential_key, **good_login()})
     plugin._auth_init({'auto_login': True, 'douban_username': 'other@example.test', 'douban_password': 'other-secret'})
     plugin._cookie = 'dbcl2=old-user; ck=old'
     plugin._download_cookiecloud_cookies = Mock(side_effect=AssertionError('old CookieCloud should not be used'))
     plugin._load_cookie = types.MethodType(runtime[2].DoubanWatchSync._load_cookie, plugin)
-    assert plugin._load_cookie() == ''
+    assert plugin._load_cookie() == plugin._cookie
     plugin._download_cookiecloud_cookies.assert_not_called()
 
 
@@ -1202,11 +1202,11 @@ def test_account_change_allows_explicit_cloud_fallback(runtime, monkeypatch):
     plugin._auth_init({'auto_login': True, 'douban_username': 'new@example.test', 'douban_password': 'new-secret'})
     plugin._cookie = 'dbcl2=old-manual; ck=old'
     plugin._load_cookie = types.MethodType(runtime[2].DoubanWatchSync._load_cookie, plugin)
-    assert plugin._load_cookie() == ''
+    assert plugin._load_cookie() == plugin._cookie
     plugin._download_cookiecloud_cookies = Mock(return_value=({'douban.com': 'dbcl2=cloud; ck=cloud-ck'}, ''))
     monkeypatch.setattr(auth, 'browser_login', Mock(side_effect=AssertionError('cloud works')))
     client = login_client(cm, '')
-    client.login_state.return_value = True
+    client.login_state.side_effect = lambda: client.cookies.get('dbcl2') == 'cloud'
     assert plugin._write_douban(client, 'set_status', '200', 'collect', True)
     assert client.cookies['dbcl2'] == 'cloud'
 
@@ -1242,3 +1242,108 @@ def test_manual_correction_with_no_local_cookie_can_use_cloud(runtime, monkeypat
     client.remove_status.assert_called_once_with('100')
     assert plugin.get_data('archive')[key]['subject_id'] == '200'
     plugin._download_cookiecloud_cookies.assert_called_once()
+
+
+@pytest.mark.parametrize('auto_login', [True, False])
+def test_manual_cookie_overrides_saved_without_overwriting_it(runtime, monkeypatch, auto_login):
+    import time
+    plugin, auth, cm = enable_auto(runtime)
+    plugin._auto_login = auto_login
+    plugin._cookie = 'dbcl2=manual; ck=manual-ck'
+    saved = {'credential_key': plugin._credential_key, **good_login(), 'checked_at': time.time()}
+    plugin.save_data(auth.AUTH_DATA, saved)
+    plugin._download_cookiecloud_cookies = Mock(side_effect=AssertionError('manual is valid'))
+    monkeypatch.setattr(auth, 'browser_login', Mock(side_effect=AssertionError('manual is valid')))
+    plugin._load_cookie = types.MethodType(runtime[2].DoubanWatchSync._load_cookie, plugin)
+    assert plugin._load_cookie() == plugin._cookie
+    client = login_client(cm)
+    client.login_state.side_effect = lambda: client.cookies['dbcl2'] == 'manual'
+    assert plugin._write_douban(client, 'set_status', '200', 'collect', True)
+    assert client.cookies['dbcl2'] == 'manual'
+    client.login_state.assert_called_once()
+    assert plugin._auth_record()['cookie'] == saved['cookie']
+    assert plugin._auth_record()['user_agent'] == saved['user_agent']
+    plugin._download_cookiecloud_cookies.assert_not_called()
+    plugin._cookie = ''
+    assert plugin._load_cookie() == saved['cookie']
+
+
+def test_expired_manual_cookie_falls_back_to_saved_before_cloud(runtime, monkeypatch):
+    plugin, auth, cm = enable_auto(runtime)
+    plugin._cookie = 'dbcl2=manual-expired; ck=old'
+    plugin.save_data(auth.AUTH_DATA, {'credential_key': plugin._credential_key, **good_login()})
+    plugin._download_cookiecloud_cookies = Mock(side_effect=AssertionError('saved is valid'))
+    client = login_client(cm)
+    checked = []
+    def check():
+        checked.append(client.cookies['dbcl2'])
+        return client.cookies['dbcl2'] == 'fresh'
+    client.login_state.side_effect = check
+    assert plugin._write_douban(client, 'set_status', '200', 'collect', True)
+    assert checked == ['manual-expired', 'fresh']
+    assert client.user_agent == 'browser-test-agent'
+    plugin._download_cookiecloud_cookies.assert_not_called()
+
+
+def test_changed_manual_cookie_does_not_reuse_previous_validation(runtime):
+    plugin, auth, cm = enable_auto(runtime)
+    plugin._cookie = 'dbcl2=manual-one; ck=one'
+    client = login_client(cm); client.login_state.return_value = True
+    assert plugin._write_douban(client, 'set_status', '200', 'collect', True)
+    plugin._cookie = 'dbcl2=manual-two; ck=two'
+    again = login_client(cm); again.login_state.return_value = True
+    assert plugin._write_douban(again, 'set_status', '201', 'collect', True)
+    again.login_state.assert_called_once()
+    assert again.cookies['dbcl2'] == 'manual-two'
+
+
+def test_failed_manual_write_falls_back_to_saved_and_retries_once(runtime):
+    plugin, auth, cm = enable_auto(runtime)
+    plugin._cookie = 'dbcl2=manual; ck=manual-ck'
+    plugin.save_data(auth.AUTH_DATA, {'credential_key': plugin._credential_key, **good_login()})
+    client = login_client(cm)
+    client.login_state.side_effect = [True, False, True]
+    client.set_status.side_effect = [False, True]
+    assert plugin._write_douban(client, 'set_status', '200', 'collect', True)
+    assert client.cookies['dbcl2'] == 'fresh'
+    assert client.set_status.call_count == 2
+    assert client.login_state.call_count == 3
+    assert plugin._auth_record()['manual_checked_at'] == 0
+    again = login_client(cm)
+    again.login_state.side_effect = lambda: again.cookies['dbcl2'] == 'fresh'
+    assert plugin._write_douban(again, 'set_status', '201', 'collect', True)
+    again.set_status.assert_called_once()
+    assert again.cookies['dbcl2'] == 'fresh'
+
+
+def test_manual_saved_cloud_then_account_are_checked_in_order(runtime, monkeypatch):
+    plugin, auth, cm = enable_auto(runtime)
+    plugin._cookie = 'dbcl2=manual; ck=manual'
+    plugin.save_data(auth.AUTH_DATA, {'credential_key': plugin._credential_key, 'cookie': 'dbcl2=saved; ck=saved'})
+    order = []
+    def cloud():
+        order.append('read-cloud')
+        return {'douban.com': 'dbcl2=cloud; ck=cloud'}, ''
+    def browser(*args, **kwargs):
+        order.append('account')
+        return good_login()
+    plugin._download_cookiecloud_cookies = Mock(side_effect=cloud)
+    monkeypatch.setattr(auth, 'browser_login', Mock(side_effect=browser))
+    client = login_client(cm)
+    def check():
+        order.append('check:' + client.cookies['dbcl2'])
+        return False
+    client.login_state.side_effect = check
+    assert plugin._write_douban(client, 'set_status', '200', 'collect', True)
+    assert order == ['check:manual', 'check:saved', 'read-cloud', 'check:cloud', 'account']
+
+
+def test_manual_and_saved_identical_invalid_cookie_is_checked_once(runtime, monkeypatch):
+    plugin, auth, cm = enable_auto(runtime)
+    plugin._cookie = 'dbcl2=expired; ck=old'
+    plugin.save_data(auth.AUTH_DATA, {'credential_key': plugin._credential_key, 'cookie': 'ck=old; dbcl2=expired'})
+    plugin._use_cookiecloud = False
+    monkeypatch.setattr(auth, 'browser_login', Mock(return_value=good_login()))
+    client = login_client(cm)
+    assert plugin._write_douban(client, 'set_status', '200', 'collect', True)
+    client.login_state.assert_called_once()

@@ -256,21 +256,32 @@ class AutomaticLogin:
         client._ck = client.cookies.get("ck") or ""
         client.user_agent = record.get("user_agent") or ""
 
-    def _remember_cookie(self, client, key: str, valid: bool | None) -> bool:
+    def _remember_cookie(self, client, key: str, valid: bool | None, manual: bool = False) -> bool:
         if not self._enabled or key != self._credential_key:
             client.last_error = "配置已改变或插件已停用，请重新同步"
             return False
         record = self._auth_record()
-        self.save_data(AUTH_DATA, {**record, "credential_key": key,
-                                  "cookie": client.cookie_header(), "user_agent": client.user_agent,
-                                  "status": "登录正常" if valid else "检查失败",
-                                  "message": "" if valid else "暂时无法检查豆瓣登录态，下次同步时再检查",
-                                  "checked_at": time.time() if valid else 0,
-                                  "next_attempt": 0 if valid else record.get("next_attempt", 0)})
+        record.update(credential_key=key, status="登录正常" if valid else "检查失败",
+                      message="" if valid else "暂时无法检查豆瓣登录态，下次同步时再检查",
+                      next_attempt=0 if valid else record.get("next_attempt", 0))
+        if manual:
+            # 手填 Cookie 不覆盖账号/云获取的 Cookie，保留独立的第二级回退。
+            record.update(manual_cookie_key=credential_key(client.cookie_header(), ""),
+                          manual_checked_at=time.time() if valid else 0)
+        else:
+            record.update(cookie=client.cookie_header(), user_agent=client.user_agent,
+                          checked_at=time.time() if valid else 0)
+        self.save_data(AUTH_DATA, record)
         return True
 
+    def _forget_manual_cookie_check(self, key: str) -> None:
+        if self._enabled and key == self._credential_key:
+            record = self._auth_record()
+            if record.get("manual_checked_at"):
+                self.save_data(AUTH_DATA, {**record, "manual_checked_at": 0})
+
     def _prepare_login(self, client, force: bool = False, rejected_cookie: str = "") -> bool:
-        """实际写入时按本地、CookieCloud、账号登录的顺序选择登录态。"""
+        """实际写入时依次使用手填、插件保存、CookieCloud、账号登录。"""
         with self._login_lock:
             if not self._enabled:
                 client.last_error = "插件已停用"
@@ -278,17 +289,32 @@ class AutomaticLogin:
             key = self._credential_key
             record = self._auth_record()
             rejected = client._parse_cookie(rejected_cookie)
-            local = record.get("cookie") or client.cookie_header() or self._load_cookie()
-            self._install_login(client, {"cookie": local, "user_agent": record.get("user_agent") or client.user_agent})
+            manual = self._cookie.strip()
+            saved = record.get("cookie") or ""
+            manual_agent = (record.get("user_agent") or "") if client._parse_cookie(manual) == client._parse_cookie(saved) else ""
+            candidates = [(manual, True, manual_agent),
+                          (saved, False, record.get("user_agent") or "")]
+            if not manual and not saved:
+                candidates.append((client.cookie_header() or self._load_cookie(), False, client.user_agent))
             tried = [rejected] if rejected else []
-            if client.cookies and client.cookies not in tried:
+            for cookie, is_manual, user_agent in candidates:
+                self._install_login(client, {"cookie": cookie, "user_agent": user_agent})
+                if not client.cookies or client.cookies in tried:
+                    if is_manual and client.cookies and client.cookies == rejected:
+                        self._forget_manual_cookie_check(key)
+                    continue
                 tried.append(dict(client.cookies))
-                if not force and record.get("cookie") and record.get("status") == "登录正常" and time.time() - float(record.get("checked_at") or 0) < 600:
+                checked = record.get("checked_at")
+                if is_manual:
+                    checked = record.get("manual_checked_at") if record.get("manual_cookie_key") == credential_key(client.cookie_header(), "") else 0
+                if not force and (is_manual or saved) and record.get("status") == "登录正常" and time.time() - float(checked or 0) < 600:
                     return True
                 valid = client.login_state()
                 if valid is not False:
                     # 网络/风控异常不等于失效；仍由实际写入的响应决定是否归档。
-                    return self._remember_cookie(client, key, valid)
+                    return self._remember_cookie(client, key, valid, manual=is_manual)
+                if is_manual:
+                    self._forget_manual_cookie_check(key)
             if not self._enabled or key != self._credential_key:
                 client.last_error = "配置已改变或插件已停用，请重新同步"
                 return False

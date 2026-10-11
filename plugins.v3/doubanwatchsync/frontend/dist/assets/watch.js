@@ -161,7 +161,7 @@ export const Config = defineComponent({
           renderNative(formFields(rows.value[7], ['use_cookiecloud']), model),
           ...rows.value.slice(11, 12).map(row => renderNative(row, model)),
           ...(model.auto_login ? rows.value.slice(12).map(row => renderNative(row, model)) : []),
-          h('p', { class: 'dw-subtle' }, model.auto_login ? '同步时先使用插件保存的 Cookie；失效后尝试已启用的 CookieCloud，再使用账号登录。遇到滑块或账号登录失败时发送二维码，扫码确认后保存 Cookie 并继续同步。' : '同步时先使用插件保存的 Cookie；失效后尝试已启用的 CookieCloud。需要账号登录及扫码时，请开启自动续登。'),
+          h('p', { class: 'dw-subtle' }, model.auto_login ? '同步时优先使用手填 Cookie，再尝试插件保存的 Cookie、已启用的 CookieCloud，最后使用账号登录。遇到滑块或账号登录失败时发送二维码，扫码确认后保存 Cookie 并继续同步。' : '同步时优先使用手填 Cookie，再尝试插件保存的 Cookie、已启用的 CookieCloud。需要账号登录及扫码时，请开启自动续登。'),
           model.auto_login ? button('获取登录 Cookie', () => login.mutate('login', {}), { disabled: ['正在登录', '等待扫码'].includes(login.data.value.login?.status) }) : null,
           notification(login),
           h('div', { class: 'dw-notice', role: 'status', 'aria-live': 'polite' }, [
