@@ -224,7 +224,7 @@ export const Page = defineComponent({
         notification(state),
         tab.value === 'unmatched' ? h('p', { class: 'dw-subtle' }, '此列表中的内容已停止自动匹配；以后有豆瓣条目时，可指定编号同步，或移回待同步。') : null,
         h('div', { class: 'dw-record-list' }, filtered.value.length ? filtered.value.slice((page.value - 1) * 15, page.value * 15).map(record => h('article', { class: 'dw-record', key: record.key }, [
-          h('div', { class: 'dw-record-poster' }, record.image ? h('img', { src: record.image, alt: '', referrerpolicy: 'no-referrer', loading: 'lazy', onError: event => { event.target.style.display = 'none'; } }) : h('span', (record.title || '').slice(0, 2))),
+          h('div', { class: 'dw-record-poster' }, [h('span', { 'aria-hidden': 'true' }, (record.title || '').slice(0, 2)), record.image && h('img', { src: record.image, alt: `${record.title || '影片'}海报`, loading: 'lazy', onLoad: event => { event.target.style.display = ''; }, onError: event => { event.target.style.display = 'none'; } })]),
           h('div', { class: 'dw-record-copy' }, [h('strong', record.source_title || record.title), h('div', { class: 'dw-record-meta' }, [
             h('span', record.type === 'TV' ? '电视剧' : record.type === 'MOV' ? '电影' : record.type), record.season ? h('span', `第${record.season}季`) : null,
             h('span', record.server_name || '媒体服务器'), statusNames[record.status] ? h('span', { class: record.status === 'collect' ? 'dw-text-good' : '' }, statusNames[record.status]) : null,

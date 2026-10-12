@@ -73,7 +73,7 @@ class DoubanWatchSync(AutomaticLogin, WatchManagement, _PluginBase):
     plugin_name = "豆瓣观看同步"
     plugin_desc = "将在看、看完状态同步到豆瓣书影音档案；支持多媒体服务器路由、独立档案与重试队列。"
     plugin_icon = "https://raw.githubusercontent.com/gken6/MoviePilot-Plugins/main/icons/doubanwatchsync.svg"
-    plugin_version = "2.3.4"
+    plugin_version = "2.3.5"
     plugin_author = "gken6"
     author_url = "https://github.com/gken6"
     plugin_config_prefix = "doubanwatchsync_"
@@ -2081,16 +2081,16 @@ class DoubanWatchSync(AutomaticLogin, WatchManagement, _PluginBase):
         self._image_dirty = False
 
     def _flush_images(self) -> None:
-        """渲染结束后把新增的 data URI 落盘，下次直接使用。"""
+        """合并缓存后保存，避免仪表盘覆盖记录页面异步补齐的海报。"""
         if not self._image_dirty:
             return
-        mapping = dict(self._image_map)
-        # 超量时丢掉最早写入的一批，避免缓存无限增长
-        if len(mapping) > _IMAGE_CACHE_MAX:
-            for key in list(mapping.keys())[:len(mapping) - _IMAGE_CACHE_MAX]:
-                mapping.pop(key, None)
-        self.save_data(_KEY_IMAGES, mapping)
-        self._image_dirty = False
+        with self._lock:
+            mapping = dict(self.get_data(_KEY_IMAGES) or {})
+            mapping.update(self._image_map)
+            mapping = dict(list(mapping.items())[-_IMAGE_CACHE_MAX:])
+            self.save_data(_KEY_IMAGES, mapping)
+            self._image_map = mapping
+            self._image_dirty = False
 
     def _resolve_image(self, record: Dict[str, Any]) -> str:
         """

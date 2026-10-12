@@ -2,7 +2,7 @@
   "DoubanWatchSync": {
     "name": "豆瓣观看同步",
     "description": "将观看状态同步到豆瓣，支持独立直连 Emby、多服务器管理、人工匹配与无条目排除。",
-    "version": "2.3.4",
+    "version": "2.3.5",
     "author": "gken6",
     "level": 1,
     "icon": "https://raw.githubusercontent.com/gken6/MoviePilot-Plugins/main/icons/doubanwatchsync.svg",
@@ -11,6 +11,7 @@
     "plugin_schema_version": 1,
     "release": false,
     "history": {
+      "2.3.5": "修复观看记录海报：复用后端图片缓存，异步补齐豆瓣/TMDB 海报；失败可重试并显示标题占位。",
       "2.3.4": "MoviePilot V2.15.6 适配版：保留直连管理、手动匹配、仪表盘、Cookie 回退与账号/扫码登录。"
     }
   }

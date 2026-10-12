@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import re
 import uuid
+import time
 from datetime import datetime
 from urllib.parse import urlsplit
 
@@ -109,11 +110,19 @@ class WatchManagement:
             overrides = copy.deepcopy(self.get_data(OVERRIDES) or {})
             archive = copy.deepcopy(self.get_data("archive") or {})
             pending = copy.deepcopy(self.get_data("pending") or {})
+            images = dict(self.get_data("images") or {})
+        missing_images = set()
         def rows(mapping):
             result = []
             for key, record in mapping.items():
                 operation = corrections.get(key) or {}
-                result.append({"key": key, **record,
+                image = str(record.get("image") or "")
+                poster = ""
+                if image and DoubanClient.is_public_image_url(image):
+                    poster = images.get(image) or ""
+                    if not poster:
+                        missing_images.add(image)
+                result.append({"key": key, **record, "image": poster,
                                "manual": bool((overrides.get(key) or {}).get("subject_id")),
                                "operation": operation.get("message", ""),
                                "processing": operation.get("state") == "running",
@@ -121,8 +130,50 @@ class WatchManagement:
                                "target_id": operation.get("subject_id", ""),
                                "target_status": (operation.get("record") or {}).get("status", "")})
             return sorted(result, key=lambda row: row.get("timestamp", ""), reverse=True)
-        return {"servers": servers, "archive": rows(archive), "pending": rows(pending),
-                "unmatched": rows(ignored), "enabled": self._enabled, "login": self._auth_public()}
+        result = {"servers": servers, "archive": rows(archive), "pending": rows(pending),
+                  "unmatched": rows(ignored), "enabled": self._enabled, "login": self._auth_public()}
+        self._queue_record_images(missing_images)
+        return result
+
+    def _queue_record_images(self, urls: set) -> None:
+        """海报回源延后执行，页面刷新只读缓存；失败五分钟后允许重试。"""
+        with self._lock:
+            if getattr(self, "_record_images_busy", False):
+                return
+            retry = getattr(self, "_record_image_retry", {})
+            self._record_image_retry = retry
+            urls = [url for url in sorted(urls) if retry.get(url, 0) <= time.monotonic()][:8]
+            if not urls:
+                return
+            self._record_images_busy = True
+        def fetch():
+            try:
+                client = DoubanClient(timeout=5)
+                for url in urls:
+                    uri = client.fetch_image_data_uri(url)
+                    with self._lock:
+                        if uri:
+                            mapping = dict(self.get_data("images") or {})
+                            mapping[url] = uri
+                            mapping = dict(list(mapping.items())[-200:])
+                            self.save_data("images", mapping)
+                            self._image_map = mapping
+                            self._image_failed.discard(url)
+                            retry.pop(url, None)
+                        else:
+                            retry[url] = time.monotonic() + 300
+                with self._lock:
+                    # 冷却只保留本批及最近失败的地址，避免长期累积。
+                    self._record_image_retry = {url: until for url, until in retry.items() if until > time.monotonic()}
+            finally:
+                with self._lock:
+                    self._record_images_busy = False
+        try:
+            self._schedule_once("record_images", fetch, "缓存观看记录海报", 1)
+        except Exception:
+            with self._lock:
+                self._record_images_busy = False
+            logger.debug("登记海报缓存任务失败，下次打开记录时重试")
 
     @staticmethod
     def _public_server(item: dict) -> dict:

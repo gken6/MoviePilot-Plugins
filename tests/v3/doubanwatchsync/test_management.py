@@ -1347,3 +1347,83 @@ def test_manual_and_saved_identical_invalid_cookie_is_checked_once(runtime, monk
     client = login_client(cm)
     assert plugin._write_douban(client, 'set_status', '200', 'collect', True)
     client.login_state.assert_called_once()
+
+
+def test_management_reuses_posters_without_network_or_raw_urls(runtime):
+    plugin, management, module, queued = runtime
+    url = 'https://img3.doubanio.com/view/photo/s_ratio_poster/public/example.jpg'
+    plugin.save_data('archive', {'a': {'title': '影片', 'image': url}})
+    plugin.save_data('images', {url: 'data:image/jpeg;base64,cached'})
+    queued.clear()
+    assert plugin.api_management()['archive'][0]['image'] == 'data:image/jpeg;base64,cached'
+    assert not queued
+    assert plugin.get_data('archive')['a']['image'] == url
+
+
+def test_management_warms_posters_asynchronously_and_retries(runtime, monkeypatch):
+    plugin, management, module, queued = runtime
+    urls = ['https://image.tmdb.org/t/p/original/example.jpg', 'https://img9.doubanio.com/poster.jpg']
+    plugin.save_data('archive', {str(i): {'image': url} for i, url in enumerate(urls)})
+    queued.clear()
+    assert all(not row['image'] for row in plugin.api_management()['archive'])
+    assert len(queued) == 1
+    plugin.api_management()
+    assert len(queued) == 1
+    client = Mock()
+    client.fetch_image_data_uri.side_effect = ['data:image/jpeg;base64,new', None]
+    original = management.DoubanClient
+    monkeypatch.setattr(management, 'DoubanClient', Mock(return_value=client))
+    queued[0][1]()
+    monkeypatch.setattr(management, 'DoubanClient', original)
+    assert sum(bool(row['image']) for row in plugin.api_management()['archive']) == 1
+    assert len(queued) == 1  # Failed images are not retried every three-second refresh.
+    monkeypatch.setattr(management.time, 'monotonic', lambda: 10**12)
+    plugin.api_management()
+    assert len(queued) == 2
+
+
+def test_management_never_exposes_private_poster_urls(runtime):
+    plugin, management, module, queued = runtime
+    plugin.save_data('pending', {'a': {'image': 'http://emby.local/Items/1/Images/Primary?api_key=secret'}})
+    queued.clear()
+    assert plugin.api_management()['pending'][0]['image'] == ''
+    assert not queued
+
+
+@pytest.mark.parametrize('url', ['https://image.tmdb.org/t/p/w185/a.jpg', 'https://img.doubanio.com/a.jpg', 'https://img3.doubanio.com/a.jpg'])
+def test_public_poster_hosts(runtime, url):
+    assert runtime[2].DoubanClient.is_public_image_url(url)
+
+
+@pytest.mark.parametrize('url', ['http://img3.doubanio.com/a.jpg', 'https://img3.doubanio.com.attacker.test/a.jpg', 'https://evilimg3.doubanio.com/a.jpg', 'https://img3.doubanio.com/a.jpg?api_key=secret', 'https://u:p@image.tmdb.org/a.jpg', 'https://127.0.0.1/a.jpg', 'data:image/svg+xml,test'])
+def test_private_or_untrusted_poster_hosts_are_rejected(runtime, url):
+    assert not runtime[2].DoubanClient.is_public_image_url(url)
+
+
+def test_poster_download_is_anonymous_and_checks_image_bytes(runtime, monkeypatch):
+    import io
+    from PIL import Image
+    client_module = sys.modules[runtime[2].__name__ + '.doubanclient']
+    buf = io.BytesIO()
+    Image.new('RGB', (2, 3)).save(buf, format='JPEG')
+    response = Mock(status_code=200, content=buf.getvalue())
+    request = Mock()
+    request.get_res.return_value = response
+    factory = Mock(return_value=request)
+    monkeypatch.setattr(client_module, 'RequestUtils', factory)
+    client = runtime[2].DoubanClient(cookie='dbcl2=private; ck=private')
+    assert client.fetch_image_data_uri('https://image.tmdb.org/t/p/original/a.jpg').startswith('data:image/jpeg;base64,')
+    headers = factory.call_args.kwargs['headers']
+    assert not any(key.lower() == 'cookie' for key in headers)
+    request.get_res.assert_called_once_with('https://image.tmdb.org/t/p/w185/a.jpg', allow_redirects=False)
+    response.content = b'<html>blocked</html>'
+    assert client.fetch_image_data_uri('https://img3.doubanio.com/a.jpg') is None
+
+
+def test_dashboard_cache_flush_preserves_management_posters(runtime):
+    plugin = runtime[0]
+    plugin._image_map = {'old': 'cached-old'}
+    plugin._image_dirty = True
+    plugin.save_data('images', {'background': 'cached-new'})
+    plugin._flush_images()
+    assert plugin.get_data('images') == {'old': 'cached-old', 'background': 'cached-new'}

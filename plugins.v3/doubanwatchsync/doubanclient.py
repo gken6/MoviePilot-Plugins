@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+from urllib.parse import urlsplit
 from http.cookies import SimpleCookie
 from typing import Any, Dict, Optional, Tuple
 
@@ -147,19 +148,33 @@ class DoubanClient:
                 return value
         return None
 
+    @staticmethod
+    def is_public_image_url(url: str) -> bool:
+        """仅允许官方公开海报域名，不代理媒体服务器凭据或任意地址。"""
+        try:
+            parsed = urlsplit(url)
+            host = parsed.hostname or ""
+            return (parsed.scheme == "https" and not parsed.username and not parsed.password
+                    and parsed.port in (None, 443) and not parsed.query
+                    and (host == "image.tmdb.org" or host == "img.doubanio.com"
+                         or (host.startswith("img") and host[3:].split(".")[0].isdigit()
+                             and host.endswith(".doubanio.com") and host.count(".") == 2)))
+        except (TypeError, ValueError):
+            return False
+
     def fetch_image_data_uri(self, url: str, prefer_small: bool = True) -> Optional[str]:
-        """
-        把豆瓣图片转成 data URI。
-        豆瓣图片有防盗链：浏览器带着本站 Referer 去取会返回 403，
-        因此由后端带上豆瓣自己的 Referer 取回后内联，前端不再直接访问豆瓣。
-        """
-        if not url or "doubanio.com" not in url:
+        """匿名取回豆瓣/TMDB 小海报，避免浏览器防盗链与网络差异。"""
+        if not self.is_public_image_url(url):
             return None
         candidates = []
         if prefer_small:
-            # 海报墙只需要小图，取小图能显著降低仪表盘数据体积
             small = url.replace("/l_ratio_poster/", "/s_ratio_poster/") \
                        .replace("/m_ratio_poster/", "/s_ratio_poster/")
+            if urlsplit(url).hostname == "image.tmdb.org":
+                parts = url.split("/")
+                if len(parts) > 6 and parts[3:5] == ["t", "p"]:
+                    parts[5] = "w185"
+                    small = "/".join(parts)
             if small != url:
                 candidates.append(small)
         candidates.append(url)
@@ -169,24 +184,30 @@ class DoubanClient:
                 return result
         return None
 
-    # ---------------- 内部实现 ----------------
-
     def _download_image(self, url: str) -> Optional[str]:
-        """下载单张图片并转成 data URI，失败返回 None。"""
-        headers = self._build_base_headers()
-        headers["Referer"] = "https://movie.douban.com/"
+        """公开图片请求不携带 Cookie，不跟随重定向，只缓存栅格图片。"""
+        if not self.is_public_image_url(url):
+            return None
+        headers = {"User-Agent": _USER_AGENT}
+        if urlsplit(url).hostname.endswith("doubanio.com"):
+            headers["Referer"] = "https://movie.douban.com/"
         try:
-            response = RequestUtils(headers=headers, timeout=self._timeout).get_res(url)
-        except Exception as error:
-            logger.debug(f"下载豆瓣图片异常：{error}")
+            response = RequestUtils(headers=headers, timeout=self._timeout).get_res(url, allow_redirects=False)
+            if response is None or response.status_code != 200:
+                return None
+            content = getattr(response, "content", None)
+            if not content or len(content) > 2 * 1024 * 1024:
+                return None
+            from io import BytesIO
+            from PIL import Image
+            with Image.open(BytesIO(content)) as image:
+                content_type = {"JPEG": "image/jpeg", "PNG": "image/png", "WEBP": "image/webp", "GIF": "image/gif"}.get(image.format)
+                if not content_type or image.width * image.height > 20_000_000:
+                    return None
+                image.verify()
+            return f"data:{content_type};base64," + base64.b64encode(content).decode("ascii")
+        except Exception:
             return None
-        if response is None or response.status_code != 200:
-            return None
-        content = getattr(response, "content", None)
-        if not content or len(content) > 2 * 1024 * 1024:
-            return None
-        content_type = (response.headers.get("Content-Type") or "image/jpeg").split(";")[0].strip()
-        return f"data:{content_type};base64," + base64.b64encode(content).decode("ascii")
 
     def _post_interest(self, subject_id: str, payload: Dict[str, Any], retry: bool = False) -> bool:
         """提交状态写入请求，403 时刷新 ck 后重试一次。"""
