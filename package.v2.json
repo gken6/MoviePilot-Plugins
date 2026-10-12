@@ -1,0 +1,17 @@
+{
+  "DoubanWatchSync": {
+    "name": "豆瓣观看同步",
+    "description": "将观看状态同步到豆瓣，支持独立直连 Emby、多服务器管理、人工匹配与无条目排除。",
+    "version": "2.3.4",
+    "author": "gken6",
+    "level": 1,
+    "icon": "https://raw.githubusercontent.com/gken6/MoviePilot-Plugins/main/icons/doubanwatchsync.svg",
+    "labels": "豆瓣,观看同步",
+    "system_version": ">=2.15.6,<3.0.0",
+    "plugin_schema_version": 1,
+    "release": false,
+    "history": {
+      "2.3.4": "MoviePilot V2.15.6 适配版：保留直连管理、手动匹配、仪表盘、Cookie 回退与账号/扫码登录。"
+    }
+  }
+}

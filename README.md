@@ -1,6 +1,6 @@
 # MoviePilot 插件库
 
-由 [gken6](https://github.com/gken6) 维护，适用于 **MoviePilot V3（>=3.0.0）**。
+由 [gken6](https://github.com/gken6) 维护，提供 **MoviePilot V3（>=3.0.0）** 和 **V2.15.6（>=2.15.6,<3.0.0）** 的豆瓣观看同步版本。TG万能签到目前仅支持 V3。
 
 ## 安装与更新
 
@@ -11,6 +11,8 @@
    https://github.com/gken6/MoviePilot-Plugins
    ```
 
+同一仓库地址同时提供 V2 和 V3 索引，MoviePilot 自动选择对应版本。
+
 3. 刷新插件市场，搜索“豆瓣观看同步”，点击安装。
 4. 打开插件设置，配置媒体服务器及豆瓣登录态，然后启用插件。
 
@@ -20,10 +22,11 @@
 
 ## 插件
 
-| 插件 | 当前版本 | 功能 |
-| --- | --- | --- |
-| 豆瓣观看同步 | 2.3.4 | 将已经发生的观看同步到豆瓣，独立直连 Emby、多服务器管理、人工匹配与无条目排除 |
-| TG万能签到 | 0.3.2 | TG 个人账号逐行执行命令、等待和按钮点击，定时任务与七天运行历史 |
+| 插件 | MoviePilot 版本 | 当前版本 | 功能 |
+| --- | --- | --- | --- |
+| 豆瓣观看同步 | V3 | 2.3.4 | 将已经发生的观看同步到豆瓣，独立直连 Emby、多服务器管理、人工匹配与无条目排除 |
+| 豆瓣观看同步 | V2.15.6 | 2.3.4 | 与 V3 相同的直连、人工匹配、Cookie 回退及扫码登录功能 |
+| TG万能签到 | V3 | 0.3.2 | TG 个人账号逐行执行命令、等待和按钮点击，定时任务与七天运行历史 |
 
 ### 豆瓣观看同步
 
@@ -41,7 +44,7 @@
 
 撤销旧豆瓣标记必须能从官方页面核实接口；无法核实或执行失败时保留“旧标记待撤销”提示。此流程已有模拟测试，尚未完成真实豆瓣账号的端到端撤销验证。
 
-详细说明见 [插件文档](plugins.v3/doubanwatchsync/README.md)，来源归属见 [NOTICE.md](NOTICE.md)。
+详细说明见 [V3 插件文档](plugins.v3/doubanwatchsync/README.md)及 [V2 插件文档](plugins.v2/doubanwatchsync/README.md)，来源归属见 [NOTICE.md](NOTICE.md)。
 
 ### TG万能签到
 
@@ -53,8 +56,10 @@
 
 ```bash
 python -m pip install pytest beautifulsoup4 Pillow
+python tests/v2/doubanwatchsync/run_isolated.py
 python tests/v3/doubanwatchsync/run_isolated.py
 python tests/v3/tguniversalsign/run_isolated.py
+node tests/v2/doubanwatchsync/frontend.mjs
 node tests/v3/doubanwatchsync/frontend.mjs
 ```
 

@@ -17,9 +17,11 @@ jobs:
         with:
           node-version: '24'
       - run: python -m pip install pytest beautifulsoup4 Pillow
-      - run: python -m compileall -q plugins.v3
+      - run: python -m compileall -q plugins.v2 plugins.v3
       - run: python scripts/check_release.py
+      - run: python tests/v2/doubanwatchsync/run_isolated.py
       - run: python tests/v3/doubanwatchsync/run_isolated.py
       - run: python tests/v3/tguniversalsign/run_isolated.py
+      - run: node tests/v2/doubanwatchsync/frontend.mjs
       - run: node tests/v3/doubanwatchsync/frontend.mjs
       - run: git diff --check
