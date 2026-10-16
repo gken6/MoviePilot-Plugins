@@ -75,7 +75,7 @@ class DoubanWatchSync(AutomaticLogin, WatchManagement, _PluginBase):
     plugin_name = "豆瓣观看同步"
     plugin_desc = "将在看、看完状态同步到豆瓣书影音档案；支持多媒体服务器路由、独立档案与重试队列。"
     plugin_icon = "https://raw.githubusercontent.com/gken6/MoviePilot-Plugins/main/icons/doubanwatchsync.svg"
-    plugin_version = "2.3.6"
+    plugin_version = "2.3.7"
     plugin_author = "gken6"
     author_url = "https://github.com/gken6"
     plugin_config_prefix = "doubanwatchsync_"
@@ -659,7 +659,8 @@ class DoubanWatchSync(AutomaticLogin, WatchManagement, _PluginBase):
         episode = self._to_int(item.get("IndexNumber"), 0, 0)
         media_type = "MOV" if item_type == "Movie" else "TV"
         if media_type == "TV":
-            title = str(item.get("SeriesName") or item.get("Series") or title).strip()
+            series_title = str(item.get("SeriesName") or item.get("Series") or title).strip()
+            title = f"{series_title} {title}" if item_type == "Episode" and season == 0 and series_title != title else series_title
 
         play_state = session.get("PlayState") if isinstance(session.get("PlayState"), dict) else {}
         pos = self._to_int(play_state.get("PositionTicks"), 0, 0)
@@ -1088,15 +1089,14 @@ class DoubanWatchSync(AutomaticLogin, WatchManagement, _PluginBase):
         scope = reader.get_work_episodes(series_id, season, str(payload.get("title") or ""), episode)
         episodes = scope.get("episodes") or []
         state = self._play_state_of_any_user(series_id, season, str(payload.get("server_name") or ""))
-        minimum = int(scope.get("minimum") or 0)
         expected = self._subject_episode_count(subject_id) if subject_id else 0
-        # 普通季的总集数未知时保守保持在看；不能把媒体库里仅有的几集当成全季。
-        required = expected or minimum
+        # 所有剧集均以豆瓣总集数为准，不能用媒体库或上下集数量兜底。
+        required = expected  # Only a confirmed Douban total is authoritative.
         enough = bool(required and len(episodes) >= required)
         if season > 0 and expected:
             enough = enough and set(range(1, expected + 1)).issubset(episodes)
         coverage = bool(episodes and enough and all(index in state for index in episodes))
-        incomplete = bool(episodes and required and (not enough or any(state.get(index) is False for index in episodes)))
+        incomplete = bool(episodes and (any(state.get(index) is False for index in episodes) or (required and not enough)))
         known = coverage or incomplete
         played = [index for index in episodes if state.get(index) is True]
         return {"complete": bool(coverage and len(played) == len(episodes)), "known": known,
@@ -1111,12 +1111,27 @@ class DoubanWatchSync(AutomaticLogin, WatchManagement, _PluginBase):
         if saved.get("expires", 0) > time.time():
             return int(saved.get("count") or 0)
         detail = DoubanClient().get_subject_info(subject_id, "TV") or {}
-        count = self._to_int(detail.get("episodes_count"), 0, 0)
+        fresh_count = self._to_int(detail.get("episodes_count"), 0, 0)
+        count = fresh_count
+        # A failed refresh must not erase the last successfully read Douban total.
+        if not count:
+            count = self._to_int(saved.get("count"), 0, 0)
         with self._lock:
             cache = self.get_data("episode_counts") or {}
-            cache[subject_id] = {"count": count, "expires": time.time() + (21600 if count else 300)}
+            cache[subject_id] = {"count": count, "expires": time.time() + (21600 if fresh_count else 300)}
             self.save_data("episode_counts", cache)
         return count
+
+    def _remember_subject_info(self, subject_id: str, detail: dict) -> None:
+        """复用人工匹配时已读取的豆瓣总集数，不再另用匿名请求丢失结果。"""
+        import time
+        count = self._to_int((detail or {}).get("episodes_count"), 0, 0)
+        if not count:
+            return
+        with self._lock:
+            cache = self.get_data("episode_counts") or {}
+            cache[subject_id] = {"count": count, "expires": time.time() + 21600, "source": "douban"}
+            self.save_data("episode_counts", cache)
 
     def _resolve_status(self, payload: Dict[str, Any], reader: MediaServerReader,
                         media_type: str, season: int, episode: int, subject_id: str = "") -> str:

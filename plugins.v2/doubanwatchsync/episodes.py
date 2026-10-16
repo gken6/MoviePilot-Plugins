@@ -7,6 +7,10 @@ _PART = re.compile(r"[（(]\s*([上中下])(?:集|篇|部)?\s*[）)]\s*$")
 
 def work_title(title):
     text = unicodedata.normalize("NFKC", str(title or "")).strip()
+    # OAD numbers can differ within one Douban work: Lost Girls uses #5 and #8.
+    family = re.match(r"^(.*?)(OAD|OVA|SP)\s*#?\s*\d+(?:[-－]\d+)?\s+([^:：]+)[:：]", text, re.I)
+    if family:
+        return re.sub(r"\s+", " ", family.group(1) + family.group(2).upper() + " " + family.group(3)).strip()
     if not _PART.search(text):
         return str(title or "").strip()
     text = _PART.sub("", text).strip()
@@ -35,7 +39,7 @@ def work_episodes(items, season, title, episode):
     if not current:
         return {"episodes": [], "minimum": 0}
     name = str(current.get("Name") or "")
-    if multipart(name):
+    if multipart(name) or work_title(name) != name:
         group = [item for item in selected if same_work(item.get("Name"), name)]
         minimum = 3 if any("(中" in unicodedata.normalize("NFKC", item.get("Name") or "") for item in group) else 2
     else:

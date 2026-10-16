@@ -1507,7 +1507,7 @@ def test_special_completion_requires_both_episodes(runtime,played,expected):
     plugin=runtime[0]
     reader=Mock();reader.get_series_id.return_value='series';reader.get_work_episodes.return_value={'episodes':[15,16],'minimum':2}
     plugin._play_state_of_any_user=Mock(return_value=played)
-    plugin._subject_episode_count=Mock(return_value=0)
+    plugin._subject_episode_count=Mock(return_value=2)
     payload={'title':DOWN,'item_id':'series','server_name':'example-server','season':0,'episode':16}
     assert plugin._resolve_status(payload,reader,'TV',0,16,'25949760')==expected
 
@@ -1537,7 +1537,7 @@ def test_second_episode_automatically_reuses_manual_id_without_search(runtime,mo
     reader=Mock();reader.get_series_id.return_value='series';reader.get_work_episodes.return_value={'episodes':[15,16],'minimum':2}
     reader.get_douban_id=Mock(side_effect=AssertionError('must reuse manual subject'))
     plugin._reader=Mock(return_value=reader)
-    plugin._subject_episode_count=Mock(return_value=0)
+    plugin._subject_episode_count=Mock(return_value=2)
     plugin._play_state_of_any_user=Mock(return_value={15:True,16:True})
     plugin._search_subject=Mock(side_effect=AssertionError('must not search again'))
     client=Mock();client.get_subject_image.return_value=''
@@ -1654,3 +1654,70 @@ def test_late_progress_result_does_not_overwrite_new_manual_match(runtime):
     plugin._refresh_work_progress([key])
     assert plugin.get_data('archive')[key]['subject_id']=='new'
     assert 'watched_episodes' not in plugin.get_data('archive')[key]
+
+
+def lost_items():
+    return [{'Name':'OAD #5-1 迷失的女孩：再见，希娜之墙（上集）','IndexNumber':17,'ParentIndexNumber':0},
+            {'Name':'OAD #5-2 迷失的女孩：再见，希娜之墙（下集）','IndexNumber':18,'ParentIndexNumber':0},
+            {'Name':'OAD #8 迷失的女孩：迷失在残酷的世界里','IndexNumber':19,'ParentIndexNumber':0},
+            {'Name':'OAD #4-1 无悔的选择（上集）','IndexNumber':15,'ParentIndexNumber':0}]
+
+
+def test_lost_girls_groups_three_episodes_and_reuses_id_across_oad_numbers(runtime):
+    plugin=runtime[0]
+    reader_module=sys.modules[runtime[2].__name__+'.mediaserver']
+    reader=reader_module.MediaServerReader();reader.get_season_episode_items=Mock(return_value=lost_items())
+    first='进击的巨人 '+lost_items()[0]['Name']
+    last='进击的巨人 '+lost_items()[2]['Name']
+    assert plugin._archive_key(first,'TV',0,'sample')==plugin._archive_key(last,'TV',0,'sample')
+    assert reader.get_work_episodes('series',0,last,19)['episodes']==[17,18,19]
+    assert plugin._archive_key(first,'TV',0,'sample')!=plugin._archive_key('进击的巨人 '+lost_items()[3]['Name'],'TV',0,'sample')
+
+
+@pytest.mark.parametrize('count,state,result',[(3,{17:True,18:True,19:False},'do'),(3,{17:True,18:True,19:True},'collect'),(0,{17:True,18:True,19:True},'do')])
+def test_official_total_is_required_and_all_three_episodes_must_be_watched(runtime,count,state,result):
+    plugin=runtime[0];reader=Mock();reader.get_series_id.return_value='series'
+    reader.get_work_episodes.return_value={'episodes':[17,18,19],'minimum':2}
+    plugin._subject_episode_count=Mock(return_value=count)
+    plugin._play_state_of_any_user=Mock(return_value=state)
+    payload={'title':'Lost Girls','season':0,'episode':19,'item_id':'series'}
+    assert plugin._resolve_status(payload,reader,'TV',0,19,'27144865')==result
+    assert payload['expected_episodes']==count
+
+
+def test_failed_refresh_keeps_previous_douban_total(runtime,monkeypatch):
+    plugin,_,module,_=runtime
+    plugin.save_data('episode_counts',{'27144865':{'count':3,'expires':0}})
+    client=Mock();client.get_subject_info.return_value=None
+    monkeypatch.setattr(module,'DoubanClient',Mock(return_value=client))
+    assert plugin._subject_episode_count('27144865')==3
+    assert plugin.get_data('episode_counts')['27144865']['count']==3
+
+
+def test_manual_details_cache_douban_total_before_completion(runtime):
+    plugin=runtime[0]
+    plugin._remember_subject_info('27144865',{'title':'Lost Girls','episodes_count':'3'})
+    assert plugin._subject_episode_count('27144865')==3
+    plugin._remember_subject_info('27144865',{'episodes_count':0})
+    assert plugin._subject_episode_count('27144865')==3
+
+
+def test_missing_api_episode_count_falls_back_to_official_html(runtime,monkeypatch):
+    client_module=sys.modules[runtime[2].__name__+'.doubanclient']
+    api_module=types.ModuleType('app.modules.douban.apiv2')
+    api_module.DoubanApi=Mock(return_value=types.SimpleNamespace(tv_detail=Mock(return_value={'title':'Lost Girls'})))
+    monkeypatch.setitem(sys.modules,'app.modules.douban.apiv2',api_module)
+    response=Mock(status_code=200,text='<h1><span property="v:itemreviewed">Lost Girls</span></h1><div id="info"><span>集数 </span>: 3</div>')
+    monkeypatch.setattr(client_module,'RequestUtils',Mock(return_value=types.SimpleNamespace(get_res=Mock(return_value=response))))
+    assert client_module.DoubanClient().get_subject_info('27144865','TV')['episodes_count']==3
+
+
+def test_upgrade_clears_inferred_total_but_retains_confirmed_douban_total(runtime):
+    plugin=runtime[0]
+    plugin.data.pop('official_episode_totals_v1',None)
+    plugin.save_data('archive',{'a':{'type':'电视剧','subject_id':'a','expected_episodes':2},'b':{'type':'电视剧','subject_id':'b','expected_episodes':2}})
+    plugin.save_data('episode_counts',{'b':{'count':3}})
+    plugin._clear_inferred_totals()
+    assert plugin.get_data('archive')['a']['expected_episodes']==0
+    assert plugin.get_data('archive')['b']['expected_episodes']==3
+    assert plugin.get_data('inferred_episode_totals_backup')['archive']['a']['expected_episodes']==2

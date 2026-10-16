@@ -401,6 +401,7 @@ class DoubanClient:
 
     def get_subject_info(self, subject_id: str, media_type: str = "TV") -> Optional[Dict[str, Any]]:
         """读取人工编号对应的真实标题和封面；未取得条目详情时不写入。"""
+        fallback = None
         try:
             from app.modules.douban.apiv2 import DoubanApi
             api = DoubanApi()
@@ -408,7 +409,9 @@ class DoubanClient:
             if isinstance(detail, dict) and detail.get("title"):
                 pic = detail.get("pic") or {}
                 image = next((pic.get(key) for key in ("large", "normal", "medium", "small") if pic.get(key)), "") if isinstance(pic, dict) else ""
-                return {"title": str(detail["title"]), "image": str(image), "episodes_count": detail.get("episodes_count") or 0}
+                fallback = {"title": str(detail["title"]), "image": str(image), "episodes_count": detail.get("episodes_count") or 0}
+                if media_type != "TV" or fallback["episodes_count"]:
+                    return fallback
         except Exception:
             pass
         try:
@@ -416,19 +419,19 @@ class DoubanClient:
             response = RequestUtils(headers=self._build_headers(subject_id), timeout=self._timeout).get_res(
                 f"https://movie.douban.com/subject/{subject_id}/")
             if response is None or response.status_code != 200:
-                return None
+                return fallback
             soup = BeautifulSoup(response.text, "html.parser")
             title = soup.select_one('h1 span[property="v:itemreviewed"]')
             image = soup.select_one('#mainpic img')
             if title and title.get_text(strip=True):
                 import re
                 info = soup.select_one('#info')
-                count = re.search(r"集数[:：]\s*(\d+)", info.get_text(" ", strip=True)) if info else None
+                count = re.search(r"集数\s*[:：]\s*(\d+)", info.get_text(" ", strip=True)) if info else None
                 return {"title": title.get_text(strip=True), "image": str(image.get("src") or "") if image else "",
                         "episodes_count": int(count.group(1)) if count else 0}
         except Exception:
             pass
-        return None
+        return fallback
 
     def remove_status(self, subject_id: str) -> bool:
         """仅按豆瓣官方页面脚本中可核实的撤销端点取消旧标记；无法核实时保留待处理。"""

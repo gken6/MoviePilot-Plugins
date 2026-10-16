@@ -79,12 +79,39 @@ class WatchManagement:
                     changed = True
                     refreshed.add(new)
             if changed:
+                version_backup = "episode_work_backup_" + self.plugin_version
+                if not self.get_data(version_backup):
+                    self.save_data(version_backup, {key: self.get_data(key) or {} for key in stores})
                 if not self.get_data("episode_work_backup"):
                     self.save_data("episode_work_backup", {key: self.get_data(key) or {} for key in stores})
                 self.save_data("work_progress_pending", sorted(set(self.get_data("work_progress_pending") or []) | refreshed))
                 for key, value in stores.items():
                     if key != CORRECTIONS:
                         self.save_data(key, value)
+
+    def _clear_inferred_totals(self) -> None:
+        """旧版上下集推断值不是豆瓣总集数，升级时清除未获官方确认的值。"""
+        with self._lock:
+            if self.get_data("official_episode_totals_v1"):
+                return
+            counts = self.get_data("episode_counts") or {}
+            backup = {}
+            for bucket in ("archive", "pending", IGNORED):
+                records = copy.deepcopy(self.get_data(bucket) or {})
+                changed = False
+                for record in records.values():
+                    if not str(record.get("type") or "").startswith(("TV", "电视剧")):
+                        continue
+                    total = int((counts.get(str(record.get("subject_id") or "")) or {}).get("count") or 0)
+                    if int(record.get("expected_episodes") or 0) != total:
+                        record["expected_episodes"] = total
+                        changed = True
+                if changed:
+                    backup[bucket] = self.get_data(bucket) or {}
+                    self.save_data(bucket, records)
+            if backup:
+                self.save_data("inferred_episode_totals_backup", backup)
+            self.save_data("official_episode_totals_v1", True)
 
     def _refresh_work_progress(self, keys: list) -> None:
         """升级后只读回填合并作品的分集进度，不向豆瓣提交标记。"""
@@ -121,6 +148,7 @@ class WatchManagement:
 
     def _management_init(self, config: dict) -> None:
         self._migrate_work_records()
+        self._clear_inferred_totals()
         with self._lock:
             stored = self.get_data(SERVERS)
             if stored is None:
@@ -555,6 +583,7 @@ class WatchManagement:
                     detail = client.get_subject_info(subject, media_type)
                     completion = None
                     if detail and media_type == "TV":
+                        self._remember_subject_info(subject, detail)
                         completion = self._tv_completion(
                             {**record, "title": record.get("source_title") or record.get("title") or ""},
                             self._reader(record.get("server_name"), username=record.get("user_name")), subject)

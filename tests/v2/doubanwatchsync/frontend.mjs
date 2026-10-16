@@ -63,5 +63,8 @@ assert.equal(image.props.src,'data:image/jpeg;base64,cached');
 const event={target:{style:{}}};
 image.props.onError(event);assert.equal(event.target.style.display,'none');
 image.props.onLoad(event);assert.equal(event.target.style.display,'');
+const unknownPage=Page.setup({api:{get:async()=>({servers:[],archive:[{key:'unknown',title:'show',type:'TV',expected_episodes:0}],pending:[],unmatched:[]})}},{emit:()=>{}});
+for(const fn of mounted.splice(0))await fn();
+assert.ok(flatten(unknownPage()).some(n=>n.children==='总集数待获取'));
 for(const fn of unmounted)fn();
 console.log('前端配置、登录控制、仪表盘刷新、影片/剧集状态选项、所选状态提交及失败提示：通过');

@@ -225,9 +225,9 @@ export const Page = defineComponent({
         tab.value === 'unmatched' ? h('p', { class: 'dw-subtle' }, '此列表中的内容已停止自动匹配；以后有豆瓣条目时，可指定编号同步，或移回待同步。') : null,
         h('div', { class: 'dw-record-list' }, filtered.value.length ? filtered.value.slice((page.value - 1) * 15, page.value * 15).map(record => h('article', { class: 'dw-record', key: record.key }, [
           h('div', { class: 'dw-record-poster' }, [h('span', { 'aria-hidden': 'true' }, (record.title || '').slice(0, 2)), record.image && h('img', { src: record.image, alt: `${record.title || '影片'}海报`, loading: 'lazy', onLoad: event => { event.target.style.display = ''; }, onError: event => { event.target.style.display = 'none'; } })]),
-          h('div', { class: 'dw-record-copy' }, [h('strong', record.source_title || record.title), h('div', { class: 'dw-record-meta' }, [
+          h('div', { class: 'dw-record-copy' }, [h('strong', record.subject_name || record.title || record.source_title), h('div', { class: 'dw-record-meta' }, [
             h('span', record.type === 'TV' ? '电视剧' : record.type === 'MOV' ? '电影' : record.type), record.season ? h('span', `第${record.season}季`) : null,
-            record.expected_episodes ? h('span', `已看 ${(record.watched_episodes || []).length}/${record.expected_episodes} 集`) : null,
+            record.expected_episodes ? h('span', `已看 ${(record.watched_episodes || []).length}/${record.expected_episodes} 集`) : /^(TV|电视剧)/.test(record.type || '') ? h('span', '总集数待获取') : null,
             h('span', record.server_name || '媒体服务器'), statusNames[record.status] ? h('span', { class: record.status === 'collect' ? 'dw-text-good' : '' }, statusNames[record.status]) : null,
             record.manual ? h('span', '手动匹配') : null,
           ]), record.subject_id ? h('a', { href: `https://movie.douban.com/subject/${record.subject_id}/`, target: '_blank', rel: 'noopener noreferrer', class: 'dw-subject-link' }, `豆瓣 ${record.subject_id} · ${record.subject_name || record.title}`) : h('span', { class: 'dw-subtle' }, tab.value === 'unmatched' ? '已设为无条目' : '尚未匹配豆瓣条目'),

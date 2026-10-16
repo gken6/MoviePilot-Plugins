@@ -25,9 +25,9 @@ export async function get(name) {
   if (!stylesheet && typeof document !== 'undefined') {
     stylesheet = document.createElement('link');
     stylesheet.rel = 'stylesheet';
-    stylesheet.href = new URL('watch.css?v=2.3.6-v2', import.meta.url).href;
+    stylesheet.href = new URL('watch.css?v=2.3.7-v2', import.meta.url).href;
     document.head.appendChild(stylesheet);
   }
-  const module = await import('./watch.js?v=2.3.6-v2');
+  const module = await import('./watch.js?v=2.3.7-v2');
   return () => module[component];
 }
