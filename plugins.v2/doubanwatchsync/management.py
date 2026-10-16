@@ -14,6 +14,7 @@ from app.utils.http import RequestUtils
 from app.core.security import verify_token
 
 from .doubanclient import DoubanClient
+from .episodes import work_title
 
 SERVERS = "direct_servers_v2"
 OVERRIDES = "manual_matches"
@@ -34,11 +35,92 @@ def require_manager(token=Depends(verify_token)):
 class WatchManagement:
     """管理直连账号和人工匹配，外部操作先登记后异步执行，可重试。"""
 
+    def _migrate_work_records(self) -> None:
+        """把旧版按上/下集拆开的记录合并；编号冲突或进行中的任务不猜测。"""
+        with self._lock:
+            stores = {key: copy.deepcopy(self.get_data(key) or {}) for key in
+                      ("archive", "pending", IGNORED, OVERRIDES, CORRECTIONS)}
+            records = {}
+            for bucket in ("archive", "pending", IGNORED):
+                records.update(stores[bucket])
+            groups = {}
+            for old, record in records.items():
+                if not str(record.get("type") or "").startswith(("TV", "电视剧")):
+                    continue
+                title = record.get("source_title") or record.get("title") or ""
+                new = self._archive_key(title, "TV", int(record.get("season") or 0), record.get("server_name"))
+                groups.setdefault(new, []).append(old)
+            changed = False
+            refreshed = set()
+            self._work_conflicts = set()
+            for new, old_keys in groups.items():
+                if old_keys == [new]:
+                    continue
+                subjects = {str((stores[OVERRIDES].get(key) or records[key]).get("subject_id") or "") for key in old_keys}
+                subjects.discard("")
+                ignores = {bool((stores[OVERRIDES].get(key) or {}).get("ignore")) for key in old_keys}
+                if len(subjects) > 1 or len(ignores) > 1 or any(key in stores[CORRECTIONS] for key in old_keys):
+                    self._work_conflicts.add(new)
+                    logger.warn("上下集的手动匹配存在冲突或未完成任务，保留原记录，暂停自动复用")
+                    continue
+                for bucket in ("archive", "pending", IGNORED, OVERRIDES):
+                    matches = [(key, stores[bucket][key]) for key in old_keys if key in stores[bucket]]
+                    if not matches:
+                        continue
+                    matches.sort(key=lambda pair: str(pair[1].get("timestamp") or ""))
+                    record = dict(matches[-1][1])
+                    title = record.get("source_title") or record.get("title") or ""
+                    for field in ("title", "display", "source_title", "subject_name"):
+                        if record.get(field) == title:
+                            record[field] = work_title(title)
+                    for key, _ in matches:
+                        stores[bucket].pop(key, None)
+                    stores[bucket][new] = record
+                    changed = True
+                    refreshed.add(new)
+            if changed:
+                if not self.get_data("episode_work_backup"):
+                    self.save_data("episode_work_backup", {key: self.get_data(key) or {} for key in stores})
+                self.save_data("work_progress_pending", sorted(set(self.get_data("work_progress_pending") or []) | refreshed))
+                for key, value in stores.items():
+                    if key != CORRECTIONS:
+                        self.save_data(key, value)
+
+    def _refresh_work_progress(self, keys: list) -> None:
+        """升级后只读回填合并作品的分集进度，不向豆瓣提交标记。"""
+        for key in keys:
+            with self._lock:
+                record = copy.deepcopy((self.get_data("archive") or {}).get(key))
+            if not record or not self._direct_record_allowed(record):
+                continue
+            try:
+                reader = self._reader(record.get("server_name"), username=record.get("user_name"))
+                completion = self._tv_completion(
+                    {**record, "title": record.get("source_title") or record.get("title") or ""},
+                    reader, str(record.get("subject_id") or ""))
+                if not completion.get("episodes"):
+                    continue
+                with self._lock:
+                    archive = dict(self.get_data("archive") or {})
+                    current = archive.get(key)
+                    if not current or any(current.get(field) != record.get(field) for field in
+                                          ("subject_id", "item_id", "episode", "timestamp")):
+                        continue
+                    current.update({"work_episodes": completion["episodes"], "watched_episodes": completion["played"],
+                                    "expected_episodes": completion.get("expected", 0)})
+                    self.save_data("archive", archive)
+                    pending = set(self.get_data("work_progress_pending") or [])
+                    pending.discard(key)
+                    self.save_data("work_progress_pending", sorted(pending))
+            except Exception as error:
+                logger.debug(f"读取合并作品进度失败：{type(error).__name__}")
+
     @staticmethod
     def get_render_mode():
         return "vue", "frontend/dist/assets"
 
     def _management_init(self, config: dict) -> None:
+        self._migrate_work_records()
         with self._lock:
             stored = self.get_data(SERVERS)
             if stored is None:
@@ -73,6 +155,9 @@ class WatchManagement:
                 self._queue_server_check(identifier)
         for key in (self.get_data(CORRECTIONS) or {}):
             self._queue_correction(key)
+        progress_keys = self.get_data("work_progress_pending") or []
+        if progress_keys:
+            self._schedule_once("work_progress", lambda: self._refresh_work_progress(progress_keys), "读取合并作品观看进度", 1)
 
     def management_api(self) -> list:
         return [
@@ -468,12 +553,23 @@ class WatchManagement:
                     media_type = "TV" if str(record.get("type") or "").startswith(("TV", "电视剧")) else "MOV"
                     # 验证真实条目，避免把任意数字当成有效豆瓣编号。
                     detail = client.get_subject_info(subject, media_type)
+                    completion = None
+                    if detail and media_type == "TV":
+                        completion = self._tv_completion(
+                            {**record, "title": record.get("source_title") or record.get("title") or ""},
+                            self._reader(record.get("server_name"), username=record.get("user_name")), subject)
+                    if completion is not None and record.get("status") == "collect" and not completion["complete"]:
+                        record = {**record, "status": "do"}
+                        logger.info("剧集尚未确认全部集数看完，本次按在看同步；手动编号继续复用")
                     if not detail:
                         message = "无法读取该豆瓣条目，请核对编号或稍后重试"
                     elif self._write_douban(client, "set_status", subject, record.get("status") or "do", self._private):
                         payload = {"episode": record.get("episode", 0), "item_id": record.get("item_id", ""),
                                    "server_name": record.get("server_name", ""), "user_name": record.get("user_name", ""),
                                    "title": record.get("source_title") or record.get("title") or "", "direct_id": record.get("direct_id") or ""}
+                        if completion is not None:
+                            payload.update({"work_episodes": completion["episodes"], "watched_episodes": completion["played"],
+                                            "expected_episodes": completion.get("expected", 0)})
                         title = str(detail.get("title") or record.get("subject_name") or record.get("title") or key)
                         self._save_archive(key, payload, title, subject, int(record.get("season") or 0), media_type,
                                            record.get("status") or "do", title, image=str(detail.get("image") or ""))
@@ -520,7 +616,7 @@ class WatchManagement:
 
     def _manual_guard(self, key: str) -> bool:
         override = (self.get_data(OVERRIDES) or {}).get(key) or {}
-        return bool(override.get("ignore") or key in (self.get_data(CORRECTIONS) or {}))
+        return bool(override.get("ignore") or key in getattr(self, "_work_conflicts", set()) or key in (self.get_data(CORRECTIONS) or {}))
 
     def _manual_subject(self, key: str) -> str:
         return str(((self.get_data(OVERRIDES) or {}).get(key) or {}).get("subject_id") or "")

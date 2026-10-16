@@ -310,6 +310,7 @@ def test_same_subject_resync_does_not_delete_marker(runtime, monkeypatch):
 ])
 def test_manual_status_is_validated_by_type(runtime, monkeypatch, media_type, status, valid):
     plugin, management, _, _ = runtime
+    plugin._tv_completion = Mock(return_value={"complete":True,"known":True,"episodes":[1,2],"played":[1,2],"expected":2})
     key = 'pending'
     plugin.save_data('pending', {key: {'title': 'source', 'type': media_type, 'status': 'do'}})
     client = fake_client(monkeypatch, management)
@@ -326,6 +327,7 @@ def test_manual_status_is_validated_by_type(runtime, monkeypatch, media_type, st
 
 def test_manual_same_subject_can_change_in_progress_to_watched(runtime, monkeypatch):
     plugin, management, _, _ = runtime
+    plugin._tv_completion = Mock(return_value={"complete":True,"known":True,"episodes":[1,2],"played":[1,2],"expected":2})
     key = archive_record(plugin)
     archive = plugin.get_data('archive'); archive[key].update(type='电视剧', status='do')
     plugin.save_data('archive', archive)
@@ -1484,3 +1486,228 @@ def test_dashboard_cache_flush_preserves_management_posters(runtime):
     plugin.save_data('images', {'background': 'cached-new'})
     plugin._flush_images()
     assert plugin.get_data('images') == {'old': 'cached-old', 'background': 'cached-new'}
+
+UP = '进击的巨人 OAD #4-1 无悔的选择（上集）'
+DOWN = '进击的巨人 OAD #4-2 无悔的选择（下集）'
+
+
+def episode_record(title, episode, subject='25949760'):
+    return {'title': title, 'source_title': title, 'subject_name': title, 'subject_id': subject,
+            'type': '电视剧', 'season': 0, 'episode': episode, 'server_name': 'example-server',
+            'item_id': 'example-series', 'status': 'collect', 'timestamp': f'2025-01-01 23:{episode}:00'}
+
+
+def test_multipart_key_reuses_work_but_isolates_other_oad_and_servers(runtime):
+    plugin = runtime[0]
+    key = plugin._archive_key(UP, 'TV', 0, 'example-server')
+    assert key == plugin._archive_key(DOWN, 'TV', 0, 'example-server')
+    assert key != plugin._archive_key('进击的巨人 OAD #3 困难', 'TV', 0, 'example-server')
+    assert key != plugin._archive_key(DOWN, 'TV', 0, 'other-server')
+    assert key != plugin._archive_key(DOWN, 'TV', 1, 'example-server')
+    assert plugin._archive_key(UP, 'MOV', 0, 'example-server') != plugin._archive_key(DOWN, 'MOV', 0, 'example-server')
+
+
+def test_migration_merges_both_manual_ids_without_writes_and_is_idempotent(runtime):
+    plugin, management, module, queued = runtime
+    old = {UP+'@example-server': episode_record(UP,15), DOWN+'@example-server': episode_record(DOWN,16)}
+    plugin.save_data('archive', old)
+    plugin.save_data(management.OVERRIDES, {key:{'subject_id':'25949760','ignore':False} for key in old})
+    plugin._migrate_work_records()
+    key = plugin._archive_key(DOWN, 'TV', 0, 'example-server')
+    assert list(plugin.get_data('archive')) == [key]
+    assert plugin._manual_subject(plugin._archive_key(UP, 'TV', 0, 'example-server')) == '25949760'
+    assert plugin._manual_subject(key) == '25949760'
+    assert plugin.get_data('archive')[key]['episode'] == 16
+    assert plugin.get_data('episode_work_backup')['archive'] == old
+    saved = copy.deepcopy(plugin.data)
+    plugin._migrate_work_records()
+    assert plugin.data == saved
+
+
+def test_migration_keeps_latest_unsynced_episode_for_retry(runtime):
+    plugin, management, _, _ = runtime
+    plugin.save_data('archive', {UP+'@example-server':episode_record(UP,15)})
+    plugin.save_data('pending', {DOWN+'@example-server':episode_record(DOWN,16,subject='')})
+    plugin.save_data(management.OVERRIDES, {UP+'@example-server':{'subject_id':'25949760','ignore':False}})
+    plugin._migrate_work_records()
+    key=plugin._archive_key(UP,'TV',0,'example-server')
+    assert key in plugin.get_data('pending')
+    assert plugin._manual_subject(key)=='25949760'
+
+
+def test_migration_does_not_guess_when_manual_numbers_conflict(runtime):
+    plugin, management, _, _=runtime
+    archive={UP+'@example-server':episode_record(UP,15),DOWN+'@example-server':episode_record(DOWN,16,subject='other')}
+    plugin.save_data('archive',archive)
+    plugin.save_data(management.OVERRIDES,{key:{'subject_id':row['subject_id']} for key,row in archive.items()})
+    plugin._migrate_work_records()
+    assert plugin.get_data('archive')==archive
+    assert plugin._manual_guard(plugin._archive_key(UP,'TV',0,'example-server'))
+
+
+def test_special_work_scope_includes_only_its_two_episodes(runtime):
+    reader_module = sys.modules[runtime[2].__name__+'.mediaserver']
+    reader = reader_module.MediaServerReader()
+    reader.get_season_episode_items=Mock(return_value=[
+        {'Name':'OAD #3 困难','IndexNumber':14,'ParentIndexNumber':0},
+        {'Name':'OAD #4-1 无悔的选择（上集）','IndexNumber':15,'ParentIndexNumber':0},
+        {'Name':'OAD #4-2 无悔的选择（下集）','IndexNumber':16,'ParentIndexNumber':0},
+        {'Name':'OAD #5-1 迷失的女孩（上集）','IndexNumber':17,'ParentIndexNumber':0},
+        {'Name':'正片','IndexNumber':1,'ParentIndexNumber':1}])
+    assert reader.get_work_episodes('series',0,DOWN,16)=={'episodes':[15,16],'minimum':2}
+    assert reader.get_work_episodes('series',0,'困难',14)=={'episodes':[14],'minimum':1}
+
+
+@pytest.mark.parametrize('played,expected', [({15:True,16:False},'do'),({15:False,16:True},'do'),
+    ({15:True,16:True,14:False,17:False},'collect'),({15:True},'do'),({},'do')])
+def test_special_completion_requires_both_episodes(runtime,played,expected):
+    plugin=runtime[0]
+    reader=Mock();reader.get_series_id.return_value='series';reader.get_work_episodes.return_value={'episodes':[15,16],'minimum':2}
+    plugin._play_state_of_any_user=Mock(return_value=played)
+    plugin._subject_episode_count=Mock(return_value=0)
+    payload={'title':DOWN,'item_id':'series','server_name':'example-server','season':0,'episode':16}
+    assert plugin._resolve_status(payload,reader,'TV',0,16,'25949760')==expected
+
+
+@pytest.mark.parametrize('episodes,count,state,expected', [
+    ([1,2,3],3,{1:True,2:True,3:False},'do'),
+    ([1,2,3],3,{1:False,2:False,3:True},'do'),
+    ([1,2,3],3,{1:True,2:True,3:True},'collect'),
+    ([1,2],3,{1:True,2:True},'do'),
+    ([1,3],2,{1:True,3:True},'do'),
+    ([1,2],0,{1:True,2:True},'do'),
+    ([1,2,3],3,{1:True,3:True},'do')])
+def test_normal_season_requires_complete_episode_set_and_play_state(runtime,episodes,count,state,expected):
+    plugin=runtime[0]
+    reader=Mock();reader.get_series_id.return_value='series';reader.get_work_episodes.return_value={'episodes':episodes,'minimum':0}
+    plugin._play_state_of_any_user=Mock(return_value=state)
+    plugin._subject_episode_count=Mock(return_value=count)
+    payload={'title':'剧集','item_id':'series','season':1,'episode':3}
+    assert plugin._resolve_status(payload,reader,'TV',1,3,'200')==expected
+
+
+def test_second_episode_automatically_reuses_manual_id_without_search(runtime,monkeypatch):
+    plugin, management, module, _ = runtime
+    plugin.save_data('archive',{UP+'@example-server':episode_record(UP,15)})
+    plugin.save_data(management.OVERRIDES,{UP+'@example-server':{'subject_id':'25949760','ignore':False}})
+    plugin._migrate_work_records()
+    reader=Mock();reader.get_series_id.return_value='series';reader.get_work_episodes.return_value={'episodes':[15,16],'minimum':2}
+    reader.get_douban_id=Mock(side_effect=AssertionError('must reuse manual subject'))
+    plugin._reader=Mock(return_value=reader)
+    plugin._subject_episode_count=Mock(return_value=0)
+    plugin._play_state_of_any_user=Mock(return_value={15:True,16:True})
+    plugin._search_subject=Mock(side_effect=AssertionError('must not search again'))
+    client=Mock();client.get_subject_image.return_value=''
+    monkeypatch.setattr(module,'DoubanClient',lambda **kwargs:client)
+    plugin._write_douban=Mock(return_value=True)
+    plugin._sync_item({'title':DOWN,'media_type':'TV','season':0,'episode':16,'server_name':'example-server','item_id':'example-series'})
+    assert len(plugin.get_data('archive'))==1
+    row=next(iter(plugin.get_data('archive').values()))
+    assert row['subject_id']=='25949760'
+    assert row['watched_episodes']==[15,16]
+    assert plugin._write_douban.call_args.kwargs['subject_id']=='25949760'
+    assert plugin._write_douban.call_args.kwargs['status']=='collect'
+
+
+def test_manual_watched_falls_back_to_in_progress_until_whole_work_is_complete(runtime,monkeypatch):
+    plugin, management, _, _ = runtime
+    key=archive_record(plugin)
+    plugin.data['archive'][key].update(type='电视剧',status='do')
+    client=fake_client(monkeypatch,management)
+    plugin._tv_completion=Mock(return_value={'complete':False,'known':True,'episodes':[1,2],'played':[1],'expected':2})
+    assert plugin.api_match({'key':key,'subject_id':'100','status':'collect'})['success']
+    plugin._run_correction(key)
+    client.set_status.assert_called_once_with('100','do',True)
+    assert key not in plugin.get_data(management.CORRECTIONS)
+    assert plugin.get_data('archive')[key]['status']=='do'
+
+
+def test_season_state_includes_missing_and_never_mixes_season_zero(runtime):
+    reader_module=sys.modules[runtime[2].__name__+'.mediaserver']
+    reader=reader_module.MediaServerReader()
+    reader.get_season_episode_items=Mock(return_value=[
+        {'IndexNumber':15,'UserData':{'Played':True}},
+        {'IndexNumber':16,'IsMissing':True,'UserData':{'Played':True}}])
+    assert reader.get_season_play_state('series',0)=={15:True,16:False}
+
+
+def test_new_episode_reader_strictly_filters_specials_and_keeps_missing(runtime):
+    reader_module=sys.modules[runtime[2].__name__+'.mediaserver']
+    reader=reader_module.MediaServerReader();instance=Mock()
+    reader._locate=Mock(return_value=(instance,'emby'))
+    reader._user_scope_url=Mock(side_effect=lambda instance,url:url)
+    reader._get=Mock(return_value={'Items':[{'IndexNumber':15,'ParentIndexNumber':0},
+        {'IndexNumber':16,'ParentIndexNumber':0,'IsMissing':True},{'IndexNumber':1,'ParentIndexNumber':1}]})
+    rows=reader.get_season_episode_items('series',0)
+    assert [row['IndexNumber'] for row in rows]==[15,16]
+    assert 'IsMissing=false' not in reader._get.call_args.args[1]
+
+
+@pytest.mark.parametrize('original,complete,known,expected_write', [
+    ('collect',False,True,'do'),('collect',False,False,None),('do',True,True,'collect'),('collect',True,True,None)])
+def test_rescan_uses_work_scope_and_only_corrects_confirmed_state(runtime,monkeypatch,original,complete,known,expected_write):
+    plugin,management,module,_=runtime
+    key=archive_record(plugin)
+    plugin.data['archive'][key].update(type='电视剧',status=original,season=1,item_id='series')
+    reader=Mock();reader.get_series_id.return_value='series';plugin._reader=Mock(return_value=reader)
+    plugin._tv_completion=Mock(return_value={'complete':complete,'known':known,'episodes':[1,2],
+        'played':[1,2] if complete else [1],'expected':2})
+    plugin._write_douban=Mock(return_value=True)
+    summary=plugin.rescan_archive()
+    if expected_write:
+        assert plugin._write_douban.call_args.kwargs['status']==expected_write
+        assert plugin.get_data('archive')[key]['status']==expected_write
+    else:
+        plugin._write_douban.assert_not_called()
+        assert plugin.get_data('archive')[key]['status']==original
+
+
+def test_retry_rechecks_stale_per_episode_watched_status(runtime):
+    plugin=runtime[0]
+    plugin.save_data('pending',{'show@mp-server':{'title':'剧集','source_title':'剧集','subject_id':'200','type':'TV',
+        'status':'collect','season':1,'episode':2,'server_name':'mp-server','item_id':'series'}})
+    plugin._fill_missing_images=Mock();plugin.retry_management=Mock()
+    reader=Mock();reader.get_series_id.return_value='series';reader.get_work_episodes.return_value={'episodes':[1,2],'minimum':0}
+    plugin._reader=Mock(return_value=reader)
+    plugin._subject_episode_count=Mock(return_value=2)
+    plugin._play_state_of_any_user=Mock(return_value={1:False,2:True})
+    plugin._write_douban=Mock(return_value=True)
+    plugin.retry_pending()
+    assert plugin._write_douban.call_args.kwargs['status']=='do'
+    assert plugin.get_data('archive')['show@mp-server']['status']=='do'
+
+
+def test_subject_episode_count_reuses_public_metadata_cache(runtime,monkeypatch):
+    plugin,_,module,_=runtime
+    client=Mock();client.get_subject_info.return_value={'title':'剧集','episodes_count':12}
+    factory=Mock(return_value=client);monkeypatch.setattr(module,'DoubanClient',factory)
+    assert plugin._subject_episode_count('200')==12
+    assert plugin._subject_episode_count('200')==12
+    factory.assert_called_once_with()
+    client.get_subject_info.assert_called_once_with('200','TV')
+
+def test_progress_refresh_only_updates_local_metadata(runtime):
+    plugin=runtime[0]
+    key=archive_record(plugin)
+    plugin.data['archive'][key].update(type='电视剧')
+    plugin.save_data('work_progress_pending',[key])
+    plugin._reader=Mock()
+    plugin._tv_completion=Mock(return_value={'complete':True,'known':True,'episodes':[15,16],'played':[15,16],'expected':2})
+    plugin._write_douban=Mock(side_effect=AssertionError('progress must not write to Douban'))
+    plugin._refresh_work_progress([key])
+    assert plugin.get_data('archive')[key]['watched_episodes']==[15,16]
+    assert plugin.get_data('archive')[key]['expected_episodes']==2
+    assert plugin.get_data('work_progress_pending')==[]
+
+
+def test_late_progress_result_does_not_overwrite_new_manual_match(runtime):
+    plugin=runtime[0]
+    key=archive_record(plugin)
+    plugin._reader=Mock()
+    def completion(*args):
+        plugin.data['archive'][key]['subject_id']='new'
+        return {'complete':True,'known':True,'episodes':[1,2],'played':[1,2],'expected':2}
+    plugin._tv_completion=Mock(side_effect=completion)
+    plugin._refresh_work_progress([key])
+    assert plugin.get_data('archive')[key]['subject_id']=='new'
+    assert 'watched_episodes' not in plugin.get_data('archive')[key]

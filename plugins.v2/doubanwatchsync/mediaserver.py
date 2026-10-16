@@ -10,6 +10,8 @@ import urllib.parse
 from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import quote
 
+from .episodes import work_episodes
+
 from app.log import logger
 from app.helper.mediaserver import MediaServerHelper
 
@@ -38,6 +40,7 @@ class _DirectEmbyInstance:
         final = str(url or "")
         final = final.replace("[HOST]", self._host)
         final = final.replace("[USER]", self.user or "")
+        final = final.replace("[APIKEY]", urllib.parse.quote(self._apikey))
         # 兼容宿主写法 api_key=***，直连时替换成真实 token。
         final = final.replace("api_key=***", "api_key=" + urllib.parse.quote(self._apikey))
         if final.startswith("/emby/"):
@@ -58,7 +61,7 @@ class _DirectEmbyInstance:
                                         context=ssl.create_default_context(), timeout=20) as response:
                 return _Resp(getattr(response, "status", 200), response.read().decode("utf-8", "replace"))
         except Exception as error:
-            logger.debug(f"直连 Emby 请求失败：{error}")
+            logger.debug(f"直连 Emby 请求失败：{type(error).__name__}")
             return None
 
     def get_librarys(self):
@@ -451,43 +454,38 @@ class MediaServerReader:
         return f"{host.rstrip('/')}{path}{separator}{extra}" if extra \
             else f"{host.rstrip('/')}{path}"
 
-    def get_season_play_state(self, series_id: str, season_no: int) -> Dict[int, bool]:
-        """
-        一次性读取某一季所有集的已播放状态，返回 {集号: 是否已播放}。
-        重扫档案时用它判断整季是否看完，只需一次请求。
-        """
+    def get_season_episode_items(self, series_id: str, season_no: int) -> List[dict]:
+        """按用户读取整季元数据与播放状态，保留未播放/缺失条目。"""
         if not series_id:
-            return {}
-        instance, server_type = self._locate()
+            return []
+        key = ("season-items", f"{series_id}-{season_no}")
+        if key in self._cache:
+            return list(self._cache[key])
+        instance, _ = self._locate()
         if not instance:
-            return {}
-
-        cache_key = (server_type, f"{series_id}-playstate-{season_no}")
-        if cache_key in self._cache:
-            return dict(self._cache[cache_key])
-
-        url = self._user_scope_url(
-            instance,
-            f"/emby/Shows/{series_id}/Episodes?Season={season_no}&IsMissing=false",
-        )
-        response = self._get(instance, url)
+            return []
+        response = self._get(instance, self._user_scope_url(
+            instance, f"/emby/Shows/{series_id}/Episodes?Season={season_no}&Fields=ProviderIds"))
         items = response.get("Items") if isinstance(response, dict) else None
-        state: Dict[int, bool] = {}
-        for entry in items or []:
-            if not isinstance(entry, dict):
-                continue
-            index = self._to_int(entry.get("IndexNumber"))
+        # 季号 0 也必须精确过滤，避免接口忽略 Season 参数时混入正片。
+        result = [item for item in items or [] if isinstance(item, dict)
+                  and self._to_int(item.get("ParentIndexNumber")) == season_no]
+        self._cache[key] = result
+        return list(result)
+
+    def get_work_episodes(self, series_id: str, season_no: int, title: str, episode_no: int) -> dict:
+        return work_episodes(self.get_season_episode_items(series_id, season_no), season_no, title, episode_no)
+
+    def get_season_play_state(self, series_id: str, season_no: int) -> Dict[int, bool]:
+        """缺失、缺少播放状态、任一重复版本未播放，都不算该集完成。"""
+        state = {}
+        for item in self.get_season_episode_items(series_id, season_no):
+            index = self._to_int(item.get("IndexNumber"))
             if index is None or index <= 0:
                 continue
-            user_data = entry.get("UserData")
-            if isinstance(user_data, dict) and "Played" in user_data:
-                state[index] = bool(user_data.get("Played"))
-            else:
-                state[index] = False
-
-        self._cache[cache_key] = state
-        return dict(state)
-
+            played = not item.get("IsMissing", False) and (item.get("UserData") or {}).get("Played") is True
+            state[index] = state.get(index, True) and played
+        return state
 
     def get_playing_sessions(self) -> List[Dict[str, Any]]:
         """读取当前正在播放的会话列表。

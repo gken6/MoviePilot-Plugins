@@ -399,7 +399,7 @@ class DoubanClient:
         """把当前 cookie 拼成请求头字符串。"""
         return ";".join(f"{key}={value}" for key, value in self.cookies.items())
 
-    def get_subject_info(self, subject_id: str, media_type: str = "TV") -> Optional[Dict[str, str]]:
+    def get_subject_info(self, subject_id: str, media_type: str = "TV") -> Optional[Dict[str, Any]]:
         """读取人工编号对应的真实标题和封面；未取得条目详情时不写入。"""
         try:
             from app.modules.douban.apiv2 import DoubanApi
@@ -408,7 +408,7 @@ class DoubanClient:
             if isinstance(detail, dict) and detail.get("title"):
                 pic = detail.get("pic") or {}
                 image = next((pic.get(key) for key in ("large", "normal", "medium", "small") if pic.get(key)), "") if isinstance(pic, dict) else ""
-                return {"title": str(detail["title"]), "image": str(image)}
+                return {"title": str(detail["title"]), "image": str(image), "episodes_count": detail.get("episodes_count") or 0}
         except Exception:
             pass
         try:
@@ -421,7 +421,11 @@ class DoubanClient:
             title = soup.select_one('h1 span[property="v:itemreviewed"]')
             image = soup.select_one('#mainpic img')
             if title and title.get_text(strip=True):
-                return {"title": title.get_text(strip=True), "image": str(image.get("src") or "") if image else ""}
+                import re
+                info = soup.select_one('#info')
+                count = re.search(r"集数[:：]\s*(\d+)", info.get_text(" ", strip=True)) if info else None
+                return {"title": title.get_text(strip=True), "image": str(image.get("src") or "") if image else "",
+                        "episodes_count": int(count.group(1)) if count else 0}
         except Exception:
             pass
         return None

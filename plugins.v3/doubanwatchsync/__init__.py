@@ -31,11 +31,13 @@ try:  # 包内相对导入，兼容宿主重建实例的命名空间
     from .auth import AutomaticLogin
     from .doubanclient import DoubanClient
     from .management import WatchManagement
+    from .episodes import work_title
     from .mediaserver import MediaServerReader
 except Exception:  # pragma: no cover - 极端加载路径兜底
     from app.plugins.doubanwatchsync.auth import AutomaticLogin
     from app.plugins.doubanwatchsync.doubanclient import DoubanClient
     from app.plugins.doubanwatchsync.management import WatchManagement
+    from app.plugins.doubanwatchsync.episodes import work_title
     from app.plugins.doubanwatchsync.mediaserver import MediaServerReader
 
 # 播放开始事件：开播那一刻先记一条「在看」
@@ -73,7 +75,7 @@ class DoubanWatchSync(AutomaticLogin, WatchManagement, _PluginBase):
     plugin_name = "豆瓣观看同步"
     plugin_desc = "将在看、看完状态同步到豆瓣书影音档案；支持多媒体服务器路由、独立档案与重试队列。"
     plugin_icon = "https://raw.githubusercontent.com/gken6/MoviePilot-Plugins/main/icons/doubanwatchsync.svg"
-    plugin_version = "2.3.5"
+    plugin_version = "2.3.6"
     plugin_author = "gken6"
     author_url = "https://github.com/gken6"
     plugin_config_prefix = "doubanwatchsync_"
@@ -699,22 +701,21 @@ class DoubanWatchSync(AutomaticLogin, WatchManagement, _PluginBase):
         key = self._archive_key(title, media_type, season, server_name)
 
         reader = self._reader(server_name, username=str(payload.get("user_name") or "") or None, user_id=self._user_id_for(str(payload.get("user_name") or "") or None, server_name))
-        status = self._resolve_status(payload, reader, media_type, season, episode)
+        subject_id = self._manual_subject(key) or payload.get("subject_id") or reader.get_douban_id(payload.get("item_id") or "")
+        subject_name = title
+        if not subject_id:
+            subject_name, subject_id = self._search_subject(work_title(title), season, media_type)
+        status = self._resolve_status(payload, reader, media_type, season, episode, str(subject_id or ""))
 
         with self._lock:
             archive = self.get_data(_KEY_ARCHIVE) or {}
             record = archive.get(key)
             # 已经是「看过」就不再重复写入，但仍在看时允许升级为看过
             if isinstance(record, dict) and record.get("status") == "collect" \
-                    and status != "collect":
+                    and status != "collect" and (media_type != "TV" or not payload.get("completion_known")):
                 logger.info(f"{self._display_title(title, season)} 已标记为看完，跳过")
                 return
 
-        subject_id = self._manual_subject(key) or payload.get("subject_id") or reader.get_douban_id(payload.get("item_id") or "")
-        subject_name = title
-
-        if not subject_id:
-            subject_name, subject_id = self._search_subject(title, season, media_type)
         if not subject_id:
             logger.warn(f"{title} 未找到豆瓣条目，跳过本次同步")
             self._save_pending(key, payload, title, season, media_type, status)
@@ -780,6 +781,13 @@ class DoubanWatchSync(AutomaticLogin, WatchManagement, _PluginBase):
                         continue
                     subject_id, record["subject_id"] = found, found
                     record["subject_name"] = subject_name
+                if str(record.get("type") or "").startswith(("TV", "电视剧")):
+                    payload = {**record, "title": record.get("source_title") or record.get("title") or ""}
+                    reader = self._reader(record.get("server_name"), username=record.get("user_name"))
+                    status = self._resolve_status(payload, reader, "TV", int(record.get("season") or 0), int(record.get("episode") or 0), subject_id)
+                    record.update({"status": status, "work_episodes": payload.get("work_episodes", []),
+                                   "watched_episodes": payload.get("watched_episodes", []),
+                                   "expected_episodes": payload.get("expected_episodes", 0)})
                 if self._write_douban(client, "set_status", subject_id=subject_id, status=status, private=self._private):
                     record["subject_id"] = subject_id
                     logger.info(f"{display} 重试同步成功")
@@ -796,11 +804,11 @@ class DoubanWatchSync(AutomaticLogin, WatchManagement, _PluginBase):
         已播放标记重新判定，把看完的补标为「看过」。
 
         安全约束：
-        - 只升级为「看过」，不把已是「看过」的降级，避免误伤；
+        - 按作品全部集数重新判定；有明确未完成证据时修正为在看，信息未知时保留原状态；
         - 电影不做批量重扫（没有集号概念，直接看事件更准）；
         - 媒体服务器查不到的条目原样保留，不猜测。
         """
-        summary = {"total": 0, "upgraded": 0, "skipped": 0, "failed": 0, "details": []}
+        summary = {"total": 0, "upgraded": 0, "corrected": 0, "skipped": 0, "failed": 0, "details": []}
         if not self._enabled:
             logger.warn("插件未启用，无法重扫档案")
             return summary
@@ -830,10 +838,6 @@ class DoubanWatchSync(AutomaticLogin, WatchManagement, _PluginBase):
                 step: Dict[str, Any] = {"title": title, "season": record.get("season")}
                 trace.append(step)
 
-                if record.get("status") == "collect":
-                    step["result"] = "已是看过，跳过"
-                    summary["skipped"] += 1
-                    continue
                 # 电影没有集号概念，不参与重扫
                 if not str(record.get("type") or "").startswith("电视剧"):
                     step["result"] = "非剧集，跳过"
@@ -855,7 +859,7 @@ class DoubanWatchSync(AutomaticLogin, WatchManagement, _PluginBase):
                         summary["skipped"] += 1
                         continue
                     reader = self._reader(server_name)
-                    series_id = reader.search_series(title, season)
+                    series_id = reader.get_series_id(str(record.get("item_id") or "")) or reader.search_series(title, season)
                     step["series_id"] = series_id or ""
                     if not series_id:
                         step["result"] = "媒体服务器未搜到该剧集"
@@ -863,43 +867,32 @@ class DoubanWatchSync(AutomaticLogin, WatchManagement, _PluginBase):
                         summary["skipped"] += 1
                         continue
 
-                    episodes = reader.get_season_episodes(series_id, season)
-                    # 播放状态按用户隔离，这里汇总所有配置用户
-                    state = self._play_state_of_any_user(series_id, season, server_name)
-                    step["users"] = self._target_users()
-                    step["user_ids"] = self._target_user_ids()
-                    step["episodes_count"] = len(episodes)
-                    step["played_total"] = len(state)
-                    step["played_true"] = sum(1 for value in state.values() if value)
-                    step["played_false"] = sum(1 for value in state.values() if not value)
-
-                    if not state:
-                        step["result"] = "未读取到任何集"
-                        logger.warn(f"{title} 第{season}季未读取到任何集，跳过")
+                    completion = self._tv_completion({**record, "title": record.get("source_title") or title}, reader, subject_id)
+                    step["episodes_count"] = len(completion["episodes"])
+                    step["played_true"] = len(completion["played"])
+                    if not completion["known"]:
+                        step["result"] = "集数或播放状态未知，保留原状态"
                         summary["skipped"] += 1
                         continue
-
-                    played_true = sum(1 for value in state.values() if value)
-                    if played_true < len(state):
-                        # 把未看完的集号记下来，便于判断是哪几集没看
-                        unfinished = [index for index, value in sorted(state.items()) if not value]
-                        step["unfinished"] = unfinished[:20]
-                        step["result"] = f"未看完 {len(unfinished)} 集，保持在看"
+                    target_status = "collect" if completion["complete"] else "do"
+                    progress = {"work_episodes": completion["episodes"], "watched_episodes": completion["played"],
+                                "expected_episodes": completion.get("expected", 0)}
+                    if record.get("status") == target_status:
+                        updates[key] = {**record, **progress}
+                        step["result"] = "状态正确，仅更新分集进度"
                         summary["skipped"] += 1
                         continue
-
-                    step["result"] = "整季已看完，尝试写入豆瓣"
+                    step["result"] = "按作品全部集数修正观看状态"
                 except Exception as error:
                     step["result"] = f"读取异常：{type(error).__name__}: {error}"
                     logger.warn(f"重扫 {title} 读取播放状态失败：{error}")
                     summary["failed"] += 1
                     continue
 
-                if self._write_douban(client, "set_status", subject_id=subject_id, status="collect", private=self._private):
-                    step["result"] = "写入豆瓣成功，已升级为看过"
-                    logger.info(f"{title} 第{season}季已看完，重扫后标记为看过")
-                    updates[key] = record
-                    summary["upgraded"] += 1
+                if self._write_douban(client, "set_status", subject_id=subject_id, status=target_status, private=self._private):
+                    step["result"] = "写入豆瓣成功，已修正观看状态"
+                    updates[key] = {**record, **progress, "status": target_status, "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+                    summary["upgraded" if target_status == "collect" else "corrected"] += 1
                     summary["details"].append(title)
                 else:
                     step["result"] = "写入豆瓣失败"
@@ -927,10 +920,10 @@ class DoubanWatchSync(AutomaticLogin, WatchManagement, _PluginBase):
                 for key in updates:
                     if key not in current or self._manual_guard(key) or current[key].get("subject_id") != updates[key].get("subject_id"):
                         continue
-                    current[key]["status"] = "collect"
-                    current[key]["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    current[key].update({name: updates[key][name] for name in
+                                         ("status", "timestamp", "work_episodes", "watched_episodes", "expected_episodes")})
                 self.save_data(_KEY_ARCHIVE, current)
-            logger.info(f"重扫完成：{summary['upgraded']} 条升级为看过")
+            logger.info(f"重扫完成：{summary['upgraded']} 条看过，{summary['corrected']} 条修正为在看")
         else:
             logger.info("重扫完成：没有需要升级的条目")
 
@@ -950,13 +943,16 @@ class DoubanWatchSync(AutomaticLogin, WatchManagement, _PluginBase):
                 "subject_id": subject_id,
                 "season": season,
                 "episode": self._to_int(payload.get("episode"), 0, 0),
+                "work_episodes": list(payload.get("work_episodes") or []),
+                "watched_episodes": list(payload.get("watched_episodes") or []),
+                "expected_episodes": int(payload.get("expected_episodes") or 0),
                 "type": "电视剧" if media_type == "TV" else "电影",
                 "status": status,
                 "image": image or payload.get("image") or "",
                 "server_name": payload.get("server_name") or "",
                 "user_name": payload.get("user_name") or "",
                 "item_id": payload.get("item_id") or "",
-                "source_title": payload.get("title") or display,
+                "source_title": work_title(payload.get("title") or display) if media_type == "TV" else payload.get("title") or display,
                 "direct_id": payload.get("direct_id") or "",
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
@@ -1002,13 +998,16 @@ class DoubanWatchSync(AutomaticLogin, WatchManagement, _PluginBase):
                 "subject_id": subject_id,
                 "season": season,
                 "episode": self._to_int(payload.get("episode"), 0, 0),
+                "work_episodes": list(payload.get("work_episodes") or []),
+                "watched_episodes": list(payload.get("watched_episodes") or []),
+                "expected_episodes": int(payload.get("expected_episodes") or 0),
                 "type": media_type,
                 "status": status,
                 "image": payload.get("image") or "",
                 "server_name": payload.get("server_name") or "",
                 "item_id": payload.get("item_id") or "",
                 "user_name": payload.get("user_name") or "",
-                "source_title": payload.get("title") or subject_name,
+                "source_title": work_title(payload.get("title") or subject_name) if media_type == "TV" else payload.get("title") or subject_name,
                 "direct_id": payload.get("direct_id") or "",
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
@@ -1028,6 +1027,9 @@ class DoubanWatchSync(AutomaticLogin, WatchManagement, _PluginBase):
                 "subject_id": record.get("subject_id") or "",
                 "season": record.get("season") or 0,
                 "episode": record.get("episode") or 0,
+                "work_episodes": list(record.get("work_episodes") or []),
+                "watched_episodes": list(record.get("watched_episodes") or []),
+                "expected_episodes": int(record.get("expected_episodes") or 0),
                 "type": "电视剧" if record.get("type") == "TV" else "电影",
                 "status": record.get("status") or "do",
                 "image": record.get("image") or "",
@@ -1076,40 +1078,56 @@ class DoubanWatchSync(AutomaticLogin, WatchManagement, _PluginBase):
                 return subject_name, subject_id
         return None, None
 
-    def _resolve_status(self, payload: Dict[str, Any], reader: MediaServerReader,
-                        media_type: str, season: int, episode: int) -> str:
-        """
-        判断应写入的状态：看完→collect，在看→do。
+    def _tv_completion(self, payload: dict, reader: MediaServerReader, subject_id: str = "") -> dict:
+        """仅当前豆瓣作品的全部集数均明确看完，才判定为看过。"""
+        season = self._to_int(payload.get("season"), 0, 0)
+        episode = self._to_int(payload.get("episode"), 0, 0)
+        series_id = reader.get_series_id(str(payload.get("item_id") or ""))
+        if not series_id:
+            return {"complete": False, "known": False, "episodes": [], "played": []}
+        scope = reader.get_work_episodes(series_id, season, str(payload.get("title") or ""), episode)
+        episodes = scope.get("episodes") or []
+        state = self._play_state_of_any_user(series_id, season, str(payload.get("server_name") or ""))
+        minimum = int(scope.get("minimum") or 0)
+        expected = self._subject_episode_count(subject_id) if subject_id else 0
+        # 普通季的总集数未知时保守保持在看；不能把媒体库里仅有的几集当成全季。
+        required = expected or minimum
+        enough = bool(required and len(episodes) >= required)
+        if season > 0 and expected:
+            enough = enough and set(range(1, expected + 1)).issubset(episodes)
+        coverage = bool(episodes and enough and all(index in state for index in episodes))
+        incomplete = bool(episodes and required and (not enough or any(state.get(index) is False for index in episodes)))
+        known = coverage or incomplete
+        played = [index for index in episodes if state.get(index) is True]
+        return {"complete": bool(coverage and len(played) == len(episodes)), "known": known,
+                "episodes": episodes, "played": played, "expected": required}
 
-        判定顺序：
-        1. 电影：播放结束事件直接算看过，开播事件先记在看；
-        2. 剧集：读媒体服务器里该集的真实已播放标记，为真即看过；
-        3. 已播放标记取不到时，回退到「是否本季末集」判断；
-        4. 仍取不到（正在更新的剧集、集数元数据缺失），保守记为在看。
-        """
+    def _subject_episode_count(self, subject_id: str) -> int:
+        """只读公开条目总集数，缓存六小时；失败不会借用账号 Cookie。"""
+        import time
+        with self._lock:
+            cache = self.get_data("episode_counts") or {}
+            saved = cache.get(subject_id) or {}
+        if saved.get("expires", 0) > time.time():
+            return int(saved.get("count") or 0)
+        detail = DoubanClient().get_subject_info(subject_id, "TV") or {}
+        count = self._to_int(detail.get("episodes_count"), 0, 0)
+        with self._lock:
+            cache = self.get_data("episode_counts") or {}
+            cache[subject_id] = {"count": count, "expires": time.time() + (21600 if count else 300)}
+            self.save_data("episode_counts", cache)
+        return count
+
+    def _resolve_status(self, payload: Dict[str, Any], reader: MediaServerReader,
+                        media_type: str, season: int, episode: int, subject_id: str = "") -> str:
         if media_type != "TV":
             return "collect" if self._is_finished_event(payload) else "do"
-
-        item_id = str(payload.get("item_id") or "")
-        series_id = reader.get_series_id(item_id)
-        episode_no = self._to_int(episode, 0, 0)
-
-        if series_id and episode_no:
-            # 播放状态按用户隔离，汇总所有配置用户：任一看完即算看完
-            played = self._is_played_by_any_user(series_id, season, episode_no, str(payload.get("server_name") or ""), str(payload.get("user_name") or "") or None)
-            if played is True:
-                return "collect"
-            if played is False:
-                # 媒体服务器明确记录了「未看完」，且不是末集，直接判定在看
-                return "do"
-
-        if series_id and episode_no and self._is_last_episode(reader, series_id, season, episode_no):
-            return "collect"
-
-        logger.debug(
-            f"{payload.get('title')} S{season}E{episode_no} 未能确认为末集，"
-            f"按在看处理")
-        return "do"
+        completion = self._tv_completion(payload, reader, subject_id)
+        payload["completion_known"] = completion["known"]
+        payload["work_episodes"] = completion["episodes"]
+        payload["watched_episodes"] = completion["played"]
+        payload["expected_episodes"] = completion.get("expected", 0)
+        return "collect" if completion["complete"] else "do"
 
     @staticmethod
     def _is_last_episode(reader: MediaServerReader, series_id: str,
@@ -1632,6 +1650,7 @@ class DoubanWatchSync(AutomaticLogin, WatchManagement, _PluginBase):
     def _archive_key(self, title: str, media_type: str, season: int,
                      server_name: Optional[str] = None) -> str:
         """生成档案键。跨服务器同名条目按服务器分开保存；旧档案键保持兼容。"""
+        title = work_title(title) if media_type == "TV" else title
         base = f"{title}_S{season}" if media_type == "TV" and season else title
         server = str(server_name or "").strip()
         return f"{base}@{server}" if server else base
