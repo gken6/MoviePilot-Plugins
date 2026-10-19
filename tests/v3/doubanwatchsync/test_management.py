@@ -307,8 +307,9 @@ def test_manual_status_is_validated_by_type(runtime, monkeypatch, media_type, st
     assert result['success'] is valid
     if valid:
         plugin._run_correction(key)
-        client.set_status.assert_called_once_with('200', status, True)
-        assert plugin.data['archive'][key]['status'] == status
+        expected = 'collect' if media_type in ('TV', '电视剧') else status
+        client.set_status.assert_called_once_with('200', expected, True)
+        assert plugin.data['archive'][key]['status'] == expected
         client.remove_status.assert_not_called()
     else:
         client.set_status.assert_not_called()
@@ -1721,3 +1722,262 @@ def test_upgrade_clears_inferred_total_but_retains_confirmed_douban_total(runtim
     assert plugin.get_data('archive')['a']['expected_episodes']==0
     assert plugin.get_data('archive')['b']['expected_episodes']==3
     assert plugin.get_data('inferred_episode_totals_backup')['archive']['a']['expected_episodes']==2
+
+
+def cross_setup(runtime, *, season=1, expected=4, a_items=None, b_items=None, a_state=None, b_state=None):
+    plugin = runtime[0]
+    plugin._server = ['a', 'b']
+    def record(server):
+        return {'title': '剧集', 'source_title': '剧集', 'type': '电视剧', 'subject_id': '200',
+                'status': 'do', 'season': season, 'episode': 1, 'item_id': server + '-series',
+                'server_name': server, 'timestamp': '2026-10-19 12:00:00'}
+    records = {server: record(server) for server in ('a', 'b')}
+    plugin.save_data('archive', {server: record for server, record in records.items()})
+    readers = {}
+    for server, items in [('a', a_items), ('b', b_items)]:
+        if items is None:
+            items = [{'IndexNumber': index, 'ParentIndexNumber': season, 'Name': f'Episode {index}'} for index in range(1, expected + 1)]
+        reader = Mock()
+        reader.get_series_id.return_value = server + '-series'
+        reader.get_work_episodes.return_value = {'episodes': [row['IndexNumber'] for row in items]}
+        reader.get_season_episode_items.return_value = items
+        reader.get_douban_id.return_value = '200'
+        readers[server] = reader
+    plugin._reader = Mock(side_effect=lambda name, **kwargs: readers[name])
+    states = {'a': a_state if a_state is not None else {1: True, 2: True, 3: False, 4: False},
+              'b': b_state if b_state is not None else {1: False, 2: False, 3: True, 4: True}}
+    plugin._play_state_of_any_user = Mock(side_effect=lambda series, season, server: states[server])
+    plugin._subject_episode_count = Mock(return_value=expected)
+    plugin._write_douban = Mock(return_value=True)
+    return plugin, records, readers, states
+
+
+def test_cross_server_split_watch_is_complete_and_deduplicated(runtime):
+    plugin, records, readers, _ = cross_setup(runtime)
+    for server in ('a', 'b'):
+        completion = plugin._tv_completion(records[server], readers[server], '200')
+        assert completion['complete'] and completion['played'] == [1, 2, 3, 4]
+        assert completion['servers'] == ['a', 'b']
+
+
+def test_cross_server_repeats_do_not_add_up(runtime):
+    plugin, records, readers, _ = cross_setup(runtime, a_state={1: True, 2: True, 3: False, 4: False},
+                                             b_state={1: True, 2: True, 3: False, 4: False})
+    completion = plugin._tv_completion(records['a'], readers['a'], '200')
+    assert not completion['complete'] and completion['played'] == [1, 2]
+
+
+def test_cross_server_partial_libraries_can_supply_complete_normal_season(runtime):
+    plugin, records, readers, _ = cross_setup(runtime, expected=2,
+        a_items=[{'IndexNumber': 1}], b_items=[{'IndexNumber': 2}], a_state={1: True}, b_state={2: True})
+    completion = plugin._tv_completion(records['a'], readers['a'], '200')
+    assert completion['complete'] and completion['episodes'] == [1, 2]
+
+
+@pytest.mark.parametrize('change', ['subject', 'season', 'ignore', 'correction', 'disabled', 'deleted', 'unselected', 'missing_subject'])
+def test_cross_server_excludes_unrelated_or_disabled_records(runtime, change):
+    plugin, records, readers, _ = cross_setup(runtime)
+    if change == 'subject': plugin.data['archive']['b']['subject_id'] = 'different'
+    if change == 'season': plugin.data['archive']['b']['season'] = 2
+    if change == 'ignore': plugin.save_data('manual_matches', {'b': {'ignore': True}})
+    if change == 'correction': plugin.save_data('corrections', {'b': {'state': 'running'}})
+    if change in ('disabled', 'deleted'):
+        plugin.data['archive']['b']['direct_id'] = 'b-direct'
+        plugin.save_data('direct_servers_v2', {'b-direct': {'id': 'b-direct', 'name': 'b', 'enabled': False}} if change == 'disabled' else {})
+    if change == 'unselected': plugin._server = ['a']
+    if change == 'missing_subject': plugin.data['archive']['b']['subject_id'] = ''
+    completion = plugin._tv_completion(records['a'], readers['a'], '200')
+    assert not completion['complete'] and completion['played'] == [1, 2]
+    plugin._reader.assert_not_called()
+
+
+def test_cross_server_uses_live_progress_not_old_aggregate_archive(runtime):
+    plugin, records, readers, _ = cross_setup(runtime, a_state={1: False, 2: False, 3: False, 4: False},
+                                             b_state={1: False, 2: False, 3: False, 4: False})
+    for row in plugin.data['archive'].values(): row.update(watched_episodes=[1, 2, 3, 4], status='collect')
+    completion = plugin._tv_completion(records['a'], readers['a'], '200')
+    assert completion['known'] and not completion['complete'] and completion['played'] == []
+
+
+def test_cross_server_failed_peer_is_unknown_not_a_confirmed_downgrade(runtime):
+    plugin, records, readers, _ = cross_setup(runtime)
+    readers['b'].get_series_id.side_effect = RuntimeError('offline')
+    completion = plugin._tv_completion(records['a'], readers['a'], '200')
+    assert not completion['known'] and not completion['complete']
+
+
+def test_cross_server_one_fully_watched_server_suffices_if_peer_offline(runtime):
+    plugin, records, readers, _ = cross_setup(runtime, a_state={1: True, 2: True, 3: True, 4: True})
+    readers['b'].get_series_id.side_effect = RuntimeError('offline')
+    assert plugin._tv_completion(records['a'], readers['a'], '200')['complete']
+
+
+def test_cross_server_unknown_total_never_marks_complete(runtime):
+    plugin, records, readers, _ = cross_setup(runtime)
+    plugin._subject_episode_count.return_value = 0
+    assert not plugin._tv_completion(records['a'], readers['a'], '200')['complete']
+
+
+def special_cross(runtime, provider=True):
+    names = ['无悔的选择（上集）', '无悔的选择（下集）']
+    a = [{'Name': f'OAD #4-{index} {name}', 'IndexNumber': index + 14,
+          'ProviderIds': {'Tvdb': str(100 + index)} if provider else {}} for index, name in enumerate(names, 1)]
+    b = [{'Name': f'OVA #1-{index} {name}', 'IndexNumber': index,
+          'ProviderIds': {'Tvdb': str(100 + index)} if provider else {}} for index, name in enumerate(names, 1)]
+    return cross_setup(runtime, season=0, expected=2, a_items=a, b_items=b,
+                       a_state={15: True, 16: False}, b_state={1: False, 2: True})
+
+
+@pytest.mark.parametrize('provider', [True, False])
+def test_cross_server_specials_align_by_episode_identity_not_local_numbers(runtime, provider):
+    plugin, records, readers, _ = special_cross(runtime, provider)
+    result = plugin._tv_completion(records['a'], readers['a'], '200')
+    assert result['complete'] and len(result['played']) == 2
+
+
+def test_cross_server_specials_repeated_episode_is_not_counted_twice(runtime):
+    plugin, records, readers, states = special_cross(runtime)
+    states['b'] = {1: True, 2: False}
+    result = plugin._tv_completion(records['a'], readers['a'], '200')
+    assert not result['complete'] and len(result['played']) == 1
+
+
+def test_cross_server_specials_conflicting_provider_ids_do_not_merge_by_title(runtime):
+    plugin, records, readers, _ = special_cross(runtime)
+    for row in readers['b'].get_season_episode_items.return_value:
+        row['ProviderIds']['Tvdb'] += '-wrong'
+    result = plugin._tv_completion(records['a'], readers['a'], '200')
+    assert not result['complete'] and not result['known']
+
+
+def test_cross_server_specials_generic_titles_are_not_guessed(runtime):
+    plugin, records, readers, _ = special_cross(runtime, False)
+    for reader in readers.values():
+        for row in reader.get_season_episode_items.return_value: row['Name'] = '第1集'
+    result = plugin._tv_completion(records['a'], readers['a'], '200')
+    assert not result['complete'] and not result['known']
+
+
+def test_cross_server_auto_sync_updates_both_record_statuses_and_progress(runtime, monkeypatch):
+    plugin, records, _, _ = cross_setup(runtime)
+    client = Mock(); client.get_subject_image.return_value = ''
+    monkeypatch.setattr(runtime[2], 'DoubanClient', Mock(return_value=client))
+    plugin._sync_item({**records['a'], 'media_type': 'TV'})
+    assert plugin._write_douban.call_args.kwargs['status'] == 'collect'
+    archive = plugin.get_data('archive')
+    assert all(row['status'] == 'collect' and row['watched_episodes'] == [1,2,3,4] for row in archive.values())
+    assert {row['server_name'] for row in archive.values()} == {'a', 'b'}
+    assert all(row['progress_servers'] == ['a','b'] for row in archive.values())
+
+
+def test_cross_server_unknown_read_cannot_overwrite_completed_subject_from_other_server(runtime, monkeypatch):
+    plugin, records, readers, _ = cross_setup(runtime)
+    plugin.data['archive']['b']['status'] = 'collect'
+    readers['b'].get_series_id.side_effect = RuntimeError('offline')
+    plugin._sync_item({**records['a'], 'media_type': 'TV'})
+    plugin._write_douban.assert_not_called()
+
+
+def test_cross_server_retry_rechecks_combined_progress(runtime):
+    plugin, records, _, _ = cross_setup(runtime)
+    plugin.save_data('pending', {'a': {**records['a'], 'type': 'TV'}})
+    plugin.data['archive'].pop('a')
+    plugin.retry_management = Mock(); plugin._fill_missing_images = Mock()
+    plugin.retry_pending()
+    assert plugin._write_douban.call_args.kwargs['status'] == 'collect'
+    assert plugin.get_data('archive')['b']['status'] == 'collect'
+    assert not plugin.get_data('pending')
+
+
+def test_cross_server_rescan_does_not_downgrade_after_other_server_completed(runtime):
+    plugin, _, _, _ = cross_setup(runtime)
+    plugin.rescan_archive()
+    assert plugin._write_douban.call_count == 1
+    assert plugin._write_douban.call_args.kwargs['status'] == 'collect'
+    assert all(row['status'] == 'collect' for row in plugin.get_data('archive').values())
+
+
+def test_cross_server_manual_match_uses_combined_progress(runtime, monkeypatch):
+    plugin, _, _, _ = cross_setup(runtime)
+    client = fake_client(monkeypatch, runtime[1])
+    client.get_subject_info.return_value = {'title': '剧集', 'episodes_count': 4}
+    assert plugin.api_match({'key': 'a', 'subject_id': '200', 'status': 'do'})['success']
+    plugin._run_correction('a')
+    assert plugin._write_douban.call_args.args[3] == 'collect'
+    assert all(row['status'] == 'collect' for row in plugin.get_data('archive').values())
+
+
+def test_cross_server_upgrade_only_refreshes_metadata_and_keeps_backup(runtime):
+    plugin, _, _, _ = cross_setup(runtime)
+    plugin.data.pop('cross_server_progress_v1')
+    plugin._queue_combined_progress()
+    assert plugin.get_data('work_progress_pending') == ['a', 'b']
+    plugin._refresh_work_progress(['a', 'b'])
+    plugin._write_douban.assert_not_called()
+    assert plugin.get_data('cross_server_progress_backup')['a']['status'] == 'do'
+    assert all(row['status'] == 'do' and row['watched_episodes'] == [1,2,3,4] for row in plugin.get_data('archive').values())
+
+
+def test_cross_server_failed_submission_keeps_both_previous_states(runtime, monkeypatch):
+    plugin, records, _, _ = cross_setup(runtime)
+    plugin._write_douban.return_value = False
+    plugin._sync_item({**records['a'], 'media_type': 'TV'})
+    assert all(row['status'] == 'do' for row in plugin.get_data('archive').values())
+    assert plugin.get_data('pending')
+
+
+def test_cross_server_concurrent_events_cannot_end_with_stale_in_progress_write(runtime, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    plugin, records, _, states = cross_setup(runtime, expected=2,
+        a_state={1: True, 2: False}, b_state={1: False, 2: False})
+    first_write = Event(); release_first = Event(); second_started = Event(); second_write = Event()
+    writes = []
+    def write(client, method, *args, **kwargs):
+        status = kwargs['status']
+        if status == 'do':
+            first_write.set()
+            assert release_first.wait(3)
+        else:
+            second_write.set()
+        writes.append(status)
+        return True
+    plugin._write_douban = Mock(side_effect=write)
+    client = Mock();client.get_subject_image.return_value = ''
+    monkeypatch.setattr(runtime[2], 'DoubanClient', Mock(return_value=client))
+    def second():
+        second_started.set()
+        plugin._sync_item({**records['b'], 'media_type': 'TV'})
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(plugin._sync_item, {**records['a'], 'media_type': 'TV'})
+        assert first_write.wait(3)
+        states['b'][2] = True
+        later = pool.submit(second)
+        assert second_started.wait(3)
+        # The later complete result must not overtake the older pending write.
+        assert not second_write.wait(.05)
+        release_first.set()
+        first.result(timeout=3); later.result(timeout=3)
+    assert writes == ['do', 'collect']
+    assert all(row['status'] == 'collect' for row in plugin.get_data('archive').values())
+
+
+def test_cross_server_stale_library_id_is_relocated_with_verified_douban_id(runtime):
+    plugin, records, readers, _ = cross_setup(runtime)
+    readers['a'].get_series_id.return_value = 'old-a'
+    readers['a'].get_work_episodes.side_effect = [{'episodes': []}, {'episodes': [1,2,3,4]}]
+    readers['a'].search_series.return_value = 'new-a'
+    readers['a'].get_douban_id.return_value = '200'
+    result = plugin._tv_completion(records['a'], readers['a'], '200')
+    assert result['complete'] and result['servers'] == ['a','b']
+    readers['a'].get_douban_id.assert_called_once_with('new-a')
+
+
+def test_cross_server_stale_id_does_not_relocate_to_same_title_with_other_subject(runtime):
+    plugin, records, readers, _ = cross_setup(runtime)
+    readers['a'].get_work_episodes.return_value = {'episodes': []}
+    readers['a'].search_series.return_value = 'unrelated'
+    readers['a'].get_douban_id.return_value = 'different'
+    result = plugin._tv_completion(records['a'], readers['a'], '200')
+    assert not result['complete'] and result['played'] == [3,4]
+    assert result['servers'] == ['b']

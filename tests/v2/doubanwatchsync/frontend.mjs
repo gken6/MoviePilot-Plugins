@@ -66,5 +66,11 @@ image.props.onLoad(event);assert.equal(event.target.style.display,'');
 const unknownPage=Page.setup({api:{get:async()=>({servers:[],archive:[{key:'unknown',title:'show',type:'TV',expected_episodes:0}],pending:[],unmatched:[]})}},{emit:()=>{}});
 for(const fn of mounted.splice(0))await fn();
 assert.ok(flatten(unknownPage()).some(n=>n.children==='总集数待获取'));
+
+const combinedPage=Page.setup({api:{get:async()=>({servers:[],archive:[{key:'combined',title:'剧集',type:'TV',status:'collect',server_name:'a',expected_episodes:4,watched_episodes:[1,2,3,4],progress_servers:['a','b']}],pending:[],unmatched:[]})}},{emit:()=>{}});
+for(const fn of mounted.splice(0))await fn();
+assert.ok(flatten(combinedPage()).some(n=>n.type==='span'&&n.children==='合并已看 4/4 集'));
+assert.ok(flatten(combinedPage()).some(n=>n.type==='span'&&n.children==='2 台服务器合并进度'&&n.props.title==='a、b'));
+
 for(const fn of unmounted)fn();
-console.log('前端配置、登录控制、仪表盘刷新、影片/剧集状态选项、所选状态提交及失败提示：通过');
+console.log('前端配置、登录、海报、跨服务器合并进度和仪表盘刷新：通过');

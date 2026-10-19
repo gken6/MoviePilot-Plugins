@@ -15,6 +15,7 @@ from app.core.security import verify_token
 
 from .doubanclient import DoubanClient
 from .episodes import work_title
+from .progress import progress_fields
 
 SERVERS = "direct_servers_v2"
 OVERRIDES = "manual_matches"
@@ -115,32 +116,50 @@ class WatchManagement:
 
     def _refresh_work_progress(self, keys: list) -> None:
         """升级后只读回填合并作品的分集进度，不向豆瓣提交标记。"""
-        for key in keys:
-            with self._lock:
-                record = copy.deepcopy((self.get_data("archive") or {}).get(key))
-            if not record or not self._direct_record_allowed(record):
-                continue
-            try:
-                reader = self._reader(record.get("server_name"), username=record.get("user_name"))
-                completion = self._tv_completion(
-                    {**record, "title": record.get("source_title") or record.get("title") or ""},
-                    reader, str(record.get("subject_id") or ""))
-                if not completion.get("episodes"):
-                    continue
+        with self._sync_lock:
+            for key in keys:
                 with self._lock:
-                    archive = dict(self.get_data("archive") or {})
-                    current = archive.get(key)
-                    if not current or any(current.get(field) != record.get(field) for field in
-                                          ("subject_id", "item_id", "episode", "timestamp")):
+                    record = copy.deepcopy((self.get_data("archive") or {}).get(key))
+                if not record or not self._direct_record_allowed(record):
+                    continue
+                try:
+                    reader = self._reader(record.get("server_name"), username=record.get("user_name"))
+                    completion = self._tv_completion(
+                        {**record, "title": record.get("source_title") or record.get("title") or ""},
+                        reader, str(record.get("subject_id") or ""))
+                    if not completion.get("episodes"):
                         continue
-                    current.update({"work_episodes": completion["episodes"], "watched_episodes": completion["played"],
-                                    "expected_episodes": completion.get("expected", 0)})
-                    self.save_data("archive", archive)
-                    pending = set(self.get_data("work_progress_pending") or [])
-                    pending.discard(key)
-                    self.save_data("work_progress_pending", sorted(pending))
-            except Exception as error:
-                logger.debug(f"读取合并作品进度失败：{type(error).__name__}")
+                    with self._lock:
+                        archive = dict(self.get_data("archive") or {})
+                        current = archive.get(key)
+                        if not current or any(current.get(field) != record.get(field) for field in
+                                              ("subject_id", "item_id", "episode", "timestamp")):
+                            continue
+                        current.update(progress_fields(completion))
+                        self._share_archive_progress(archive, key)
+                        self.save_data("archive", archive)
+                        pending = set(self.get_data("work_progress_pending") or [])
+                        pending.discard(key)
+                        self.save_data("work_progress_pending", sorted(pending))
+                except Exception as error:
+                    logger.debug(f"读取合并作品进度失败：{type(error).__name__}")
+
+    def _queue_combined_progress(self) -> None:
+        """升级时仅刷新已有跨服务器作品的本地进度，不自动提交豆瓣。"""
+        if self.get_data("cross_server_progress_v1"):
+            return
+        archive = self.get_data("archive") or {}
+        groups = {}
+        for key, record in archive.items():
+            if str(record.get("type") or "").startswith(("TV", "电视剧")) and record.get("subject_id"):
+                group = (str(record["subject_id"]), int(record.get("season") or 0))
+                groups.setdefault(group, []).append(key)
+        keys = {key for rows in groups.values()
+                if len({archive[row].get("server_name") for row in rows}) > 1 for key in rows}
+        if keys:
+            self.save_data("cross_server_progress_backup", {key: archive[key] for key in keys})
+            self.save_data("work_progress_pending", sorted(set(self.get_data("work_progress_pending") or []) | keys))
+        self.save_data("cross_server_progress_v1", True)
 
     @staticmethod
     def get_render_mode():
@@ -183,6 +202,7 @@ class WatchManagement:
                 self._queue_server_check(identifier)
         for key in (self.get_data(CORRECTIONS) or {}):
             self._queue_correction(key)
+        self._queue_combined_progress()
         progress_keys = self.get_data("work_progress_pending") or []
         if progress_keys:
             self._schedule_once("work_progress", lambda: self._refresh_work_progress(progress_keys), "读取合并作品观看进度", 1)
@@ -587,18 +607,20 @@ class WatchManagement:
                         completion = self._tv_completion(
                             {**record, "title": record.get("source_title") or record.get("title") or ""},
                             self._reader(record.get("server_name"), username=record.get("user_name")), subject)
-                    if completion is not None and record.get("status") == "collect" and not completion["complete"]:
-                        record = {**record, "status": "do"}
-                        logger.info("剧集尚未确认全部集数看完，本次按在看同步；手动编号继续复用")
-                    if not detail:
+                    if completion is not None:
+                        record = {**record, "status": "collect" if completion["complete"] else "do"}
+                        if not completion["known"] and self._completed_subject(subject, int(record.get("season") or 0)):
+                            message = "媒体服务器进度读取不完整，保留原看过状态，请稍后重试"
+                    if message:
+                        pass
+                    elif not detail:
                         message = "无法读取该豆瓣条目，请核对编号或稍后重试"
                     elif self._write_douban(client, "set_status", subject, record.get("status") or "do", self._private):
                         payload = {"episode": record.get("episode", 0), "item_id": record.get("item_id", ""),
                                    "server_name": record.get("server_name", ""), "user_name": record.get("user_name", ""),
                                    "title": record.get("source_title") or record.get("title") or "", "direct_id": record.get("direct_id") or ""}
                         if completion is not None:
-                            payload.update({"work_episodes": completion["episodes"], "watched_episodes": completion["played"],
-                                            "expected_episodes": completion.get("expected", 0)})
+                            payload.update(progress_fields(completion))
                         title = str(detail.get("title") or record.get("subject_name") or record.get("title") or key)
                         self._save_archive(key, payload, title, subject, int(record.get("season") or 0), media_type,
                                            record.get("status") or "do", title, image=str(detail.get("image") or ""))
@@ -666,7 +688,7 @@ class WatchManagement:
     def _sync_item(self, payload: dict) -> None:
         key = self._archive_key(payload.get("title") or "", payload.get("media_type") or "",
                                 int(payload.get("season") or 0), payload.get("server_name"))
-        with self._get_record_lock(key):
+        with self._sync_lock, self._get_record_lock(key):
             if not self._enabled or self._manual_guard(key) or not self._direct_record_allowed(payload):
                 return
             self._sync_item_original(payload)
@@ -696,7 +718,7 @@ class WatchManagement:
         return not self._manual_guard(key)
 
     def _run_correction(self, key: str) -> None:
-        with self._get_record_lock(key):
+        with self._sync_lock, self._get_record_lock(key):
             self._apply_correction(key)
 
     def _direct_emby_sessions(self, config: dict) -> list:
