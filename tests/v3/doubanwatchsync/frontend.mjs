@@ -72,5 +72,8 @@ for(const fn of mounted.splice(0))await fn();
 assert.ok(flatten(combinedPage()).some(n=>n.type==='span'&&n.children==='合并已看 4/4 集'));
 assert.ok(flatten(combinedPage()).some(n=>n.type==='span'&&n.children==='2 台服务器合并进度'&&n.props.title==='a、b'));
 
+const movieInSeason=Page.setup({api:{get:async()=>({servers:[],archive:[{key:'s00-movie',title:'前篇',type:'电影',season:1,expected_episodes:0,status:'collect'}],pending:[],unmatched:[]})}},{emit:()=>{}});
+for(const fn of mounted.splice(0))await fn();
+assert.ok(!flatten(movieInSeason()).some(n=>n.children==='第1季'||n.children==='总集数待获取'));
 for(const fn of unmounted)fn();
 console.log('前端配置、登录、海报、跨服务器合并进度和仪表盘刷新：通过');

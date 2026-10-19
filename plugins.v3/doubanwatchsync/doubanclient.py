@@ -409,8 +409,10 @@ class DoubanClient:
             if isinstance(detail, dict) and detail.get("title"):
                 pic = detail.get("pic") or {}
                 image = next((pic.get(key) for key in ("large", "normal", "medium", "small") if pic.get(key)), "") if isinstance(pic, dict) else ""
-                fallback = {"title": str(detail["title"]), "image": str(image), "episodes_count": detail.get("episodes_count") or 0}
-                if media_type != "TV" or fallback["episodes_count"]:
+                kind = self._detail_type(detail)
+                fallback = {"title": str(detail["title"]), "image": str(image), "episodes_count": detail.get("episodes_count") or 0,
+                            "media_type": kind}
+                if kind == "MOV" or (kind == "TV" and fallback["episodes_count"]):
                     return fallback
         except Exception:
             pass
@@ -427,11 +429,51 @@ class DoubanClient:
                 import re
                 info = soup.select_one('#info')
                 count = re.search(r"集数\s*[:：]\s*(\d+)", info.get_text(" ", strip=True)) if info else None
+                text = info.get_text(" ", strip=True) if info else ""
+                kind = "TV" if re.search(r"(?:集数|首播)\s*[:：]", text) else ""
+                if not kind and re.search(r"上映日期\s*[:：]", text) and re.search(r"片长\s*[:：]", text):
+                    kind = "MOV"
+                if not kind:
+                    kind = self._form_subject_type(subject_id)
                 return {"title": title.get_text(strip=True), "image": str(image.get("src") or "") if image else "",
-                        "episodes_count": int(count.group(1)) if count else 0}
+                        "episodes_count": int(count.group(1)) if count else 0, "media_type": kind}
         except Exception:
             pass
         return fallback
+
+    @staticmethod
+    def _detail_type(detail: dict) -> str:
+        """Only explicit Douban metadata is evidence; the requested API route is not."""
+        for key in ("type", "subtype"):
+            value = str(detail.get(key) or "").lower()
+            if value in {"tv", "tvseries", "电视剧", "剧集"}:
+                return "TV"
+            if value in {"movie", "电影"}:
+                return "MOV"
+        if type(detail.get("is_tv")) is bool:
+            return "TV" if detail["is_tv"] else "MOV"
+        if str(detail.get("episodes_count") or "").isdigit() and int(detail["episodes_count"]) > 0:
+            return "TV"
+        return ""
+
+    def _form_subject_type(self, subject_id: str) -> str:
+        """Read the official interest form without submitting any state."""
+        try:
+            from bs4 import BeautifulSoup
+            response = RequestUtils(headers=self._build_headers(subject_id), timeout=self._timeout).get_res(
+                _DOUBAN_INTEREST % subject_id)
+            if response is None or response.status_code != 200:
+                return ""
+            data = response.json()
+            if not isinstance(data, dict) or not isinstance(data.get("html"), str):
+                return ""
+            soup = BeautifulSoup(data["html"], "html.parser")
+            values = {node.get("value") for node in soup.select('input[name="interest"]')}
+            if not soup.find("form") or not {"wish", "collect"}.issubset(values):
+                return ""
+            return "TV" if "do" in values else "MOV"
+        except Exception:
+            return ""
 
     def remove_status(self, subject_id: str) -> bool:
         """仅按豆瓣官方页面脚本中可核实的撤销端点取消旧标记；无法核实时保留待处理。"""

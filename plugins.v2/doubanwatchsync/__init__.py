@@ -28,6 +28,7 @@ from app.helper.mediaserver import MediaServerHelper
 from .compat import scheduler_sdk
 
 try:  # 包内相对导入，兼容宿主重建实例的命名空间
+    from .subject import SubjectRouting
     from .auth import AutomaticLogin
     from .doubanclient import DoubanClient
     from .management import WatchManagement
@@ -35,6 +36,7 @@ try:  # 包内相对导入，兼容宿主重建实例的命名空间
     from .progress import tv_completion, progress_fields, subject_records
     from .mediaserver import MediaServerReader
 except Exception:  # pragma: no cover - 极端加载路径兜底
+    from app.plugins.doubanwatchsync.subject import SubjectRouting
     from app.plugins.doubanwatchsync.auth import AutomaticLogin
     from app.plugins.doubanwatchsync.doubanclient import DoubanClient
     from app.plugins.doubanwatchsync.management import WatchManagement
@@ -70,14 +72,14 @@ _KEY_POLL = "poll"
 _IMAGE_CACHE_MAX = 200
 
 
-class DoubanWatchSync(AutomaticLogin, WatchManagement, _PluginBase):
+class DoubanWatchSync(SubjectRouting, AutomaticLogin, WatchManagement, _PluginBase):
     """把剧集/电影的观看进度写入豆瓣书影音档案。"""
 
     # 插件基本信息
     plugin_name = "豆瓣观看同步"
     plugin_desc = "将在看、看完状态同步到豆瓣书影音档案；支持多媒体服务器路由、独立档案与重试队列。"
     plugin_icon = "https://raw.githubusercontent.com/gken6/MoviePilot-Plugins/main/icons/doubanwatchsync.svg"
-    plugin_version = "2.3.8"
+    plugin_version = "2.3.9"
     plugin_author = "gken6"
     author_url = "https://github.com/gken6"
     plugin_config_prefix = "doubanwatchsync_"
@@ -363,11 +365,6 @@ class DoubanWatchSync(AutomaticLogin, WatchManagement, _PluginBase):
             return
         if not self._is_allowed_path(info.item_path):
             logger.debug(f"路径 {info.item_path} 命中排除关键词，忽略")
-            return
-
-        # 首集跳过只影响「是否写入档案」，不能影响末集升级为看过
-        if media_type == "TV" and self._skip_first and episode == 1:
-            logger.info(f"{title} 第 1 集不同步到豆瓣档案")
             return
 
         payload = {
@@ -703,14 +700,34 @@ class DoubanWatchSync(AutomaticLogin, WatchManagement, _PluginBase):
         season = self._to_int(payload.get("season"), 0, 0)
         episode = self._to_int(payload.get("episode"), 0, 0)
         server_name = str(payload.get("server_name") or "")
-        key = self._archive_key(title, media_type, season, server_name)
+        key = self._routing_key(payload)
 
         reader = self._reader(server_name, username=str(payload.get("user_name") or "") or None, user_id=self._user_id_for(str(payload.get("user_name") or "") or None, server_name))
         subject_id = self._manual_subject(key) or payload.get("subject_id") or reader.get_douban_id(payload.get("item_id") or "")
         subject_name = title
         if not subject_id:
             subject_name, subject_id = self._search_subject(work_title(title), season, media_type)
-        status = self._resolve_status(payload, reader, media_type, season, episode, str(subject_id or ""))
+        client = DoubanClient(cookie=self._load_cookie())
+        if subject_id:
+            detail = self._subject_detail(client, str(subject_id), media_type)
+            if not detail:
+                payload["subject_error"] = "无法确认豆瓣条目类型，请稍后重试"
+                self._save_pending(key, payload, subject_name, season, media_type, "do", str(subject_id))
+                return
+            media_type = detail["media_type"]
+            subject_name = detail.get("title") or subject_name
+            key, payload = self._bind_subject_kind(key, payload, media_type)
+            if media_type == "MOV":
+                if not self._movie_finished(payload, reader):
+                    return
+                status = "collect"
+            else:
+                if self._skip_first and episode == 1:
+                    logger.info(f"{title} 豆瓣剧集第 1 集不同步到档案")
+                    return
+                status = self._resolve_status(payload, reader, "TV", season, episode, str(subject_id))
+        else:
+            status = "do" if media_type == "TV" else "collect"
 
         with self._lock:
             archive = self.get_data(_KEY_ARCHIVE) or {}
@@ -727,9 +744,7 @@ class DoubanWatchSync(AutomaticLogin, WatchManagement, _PluginBase):
             self._save_pending(key, payload, title, season, media_type, status)
             return
 
-        client = DoubanClient(cookie=self._load_cookie())
-
-        display = self._display_title(subject_name or title, season)
+        display = self._display_title(subject_name or title, season) if media_type == "TV" else subject_name or title
         if self._write_douban(client, "set_status", subject_id=subject_id, status=status, private=self._private):
             logger.info(f"{display} 同步到档案成功（{self._status_text(status)}）")
             # 海报优先用豆瓣官方竖版，取不到再退回媒体服务器的图
@@ -787,7 +802,21 @@ class DoubanWatchSync(AutomaticLogin, WatchManagement, _PluginBase):
                         continue
                     subject_id, record["subject_id"] = found, found
                     record["subject_name"] = subject_name
-                if str(record.get("type") or "").startswith(("TV", "电视剧")):
+                hint = "TV" if str(record.get("type") or "").startswith(("TV", "电视剧")) else "MOV"
+                detail = self._subject_detail(client, subject_id, hint)
+                if not detail:
+                    continue
+                kind = detail["media_type"]
+                key, record = self._bind_subject_kind(key, record, kind)
+                record.update(type=kind, subject_name=detail.get("title") or record.get("subject_name"))
+                if detail.get("title"):
+                    record["display"] = detail["title"]
+                if kind == "MOV":
+                    reader = self._reader(record.get("server_name"), username=record.get("user_name"))
+                    if not self._movie_finished(record, reader):
+                        continue
+                    status = record["status"] = "collect"
+                else:
                     payload = {**record, "title": record.get("source_title") or record.get("title") or ""}
                     reader = self._reader(record.get("server_name"), username=record.get("user_name"))
                     status = self._resolve_status(payload, reader, "TV", int(record.get("season") or 0), int(record.get("episode") or 0), subject_id)
@@ -873,15 +902,32 @@ class DoubanWatchSync(AutomaticLogin, WatchManagement, _PluginBase):
                         summary["skipped"] += 1
                         continue
 
-                    completion = self._tv_completion({**record, "title": record.get("source_title") or title}, reader, subject_id)
-                    step["episodes_count"] = len(completion["episodes"])
-                    step["played_true"] = len(completion["played"])
-                    if not completion["known"]:
-                        step["result"] = "集数或播放状态未知，保留原状态"
+                    detail = self._subject_detail(client, subject_id, "TV")
+                    if not detail:
+                        step["result"] = "无法确认豆瓣条目类型，保留原记录"
                         summary["skipped"] += 1
                         continue
-                    target_status = "collect" if completion["complete"] else "do"
-                    progress = progress_fields(completion)
+                    kind = detail["media_type"]
+                    key, record = self._bind_subject_kind(key, record, kind)
+                    if kind == "MOV":
+                        if not self._movie_finished(record, reader):
+                            step["result"] = "豆瓣为影片，尚未确认对应单集已播放"
+                            summary["skipped"] += 1
+                            continue
+                        target_status = "collect"
+                        progress = {"work_episodes": [], "watched_episodes": [], "expected_episodes": 0, "progress_servers": []}
+                    else:
+                        completion = self._tv_completion({**record, "title": record.get("source_title") or title}, reader, subject_id)
+                        step["episodes_count"] = len(completion["episodes"])
+                        step["played_true"] = len(completion["played"])
+                        if not completion["known"]:
+                            step["result"] = "集数或播放状态未知，保留原状态"
+                            summary["skipped"] += 1
+                            continue
+                        target_status = "collect" if completion["complete"] else "do"
+                        progress = progress_fields(completion)
+                    progress.update(douban_type=kind, source_media_type=self._source_kind(record),
+                                    type="电视剧" if kind == "TV" else "电影")
                     if record.get("status") == target_status:
                         with self._lock:
                             latest = dict(self.get_data(_KEY_ARCHIVE) or {})
@@ -945,6 +991,8 @@ class DoubanWatchSync(AutomaticLogin, WatchManagement, _PluginBase):
                 "subject_id": subject_id,
                 "season": season,
                 "episode": self._to_int(payload.get("episode"), 0, 0),
+                "source_media_type": payload.get("source_media_type") or payload.get("media_type") or media_type,
+                "douban_type": payload.get("douban_type") or "",
                 "work_episodes": list(payload.get("work_episodes") or []),
                 "watched_episodes": list(payload.get("watched_episodes") or []),
                 "expected_episodes": int(payload.get("expected_episodes") or 0),
@@ -1002,6 +1050,8 @@ class DoubanWatchSync(AutomaticLogin, WatchManagement, _PluginBase):
                 "subject_id": subject_id,
                 "season": season,
                 "episode": self._to_int(payload.get("episode"), 0, 0),
+                "source_media_type": payload.get("source_media_type") or payload.get("media_type") or media_type,
+                "douban_type": payload.get("douban_type") or "",
                 "work_episodes": list(payload.get("work_episodes") or []),
                 "watched_episodes": list(payload.get("watched_episodes") or []),
                 "expected_episodes": int(payload.get("expected_episodes") or 0),
@@ -1014,6 +1064,9 @@ class DoubanWatchSync(AutomaticLogin, WatchManagement, _PluginBase):
                 "user_name": payload.get("user_name") or "",
                 "source_title": work_title(payload.get("title") or subject_name) if media_type == "TV" else payload.get("title") or subject_name,
                 "direct_id": payload.get("direct_id") or "",
+                "event": payload.get("event") or "",
+                "percentage": payload.get("percentage"),
+                "error": payload.get("subject_error") or "",
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
             self.save_data(_KEY_PENDING, pending)
@@ -1032,6 +1085,8 @@ class DoubanWatchSync(AutomaticLogin, WatchManagement, _PluginBase):
                 "subject_id": record.get("subject_id") or "",
                 "season": record.get("season") or 0,
                 "episode": record.get("episode") or 0,
+                "source_media_type": record.get("source_media_type") or record.get("type") or "",
+                "douban_type": record.get("douban_type") or "",
                 "work_episodes": list(record.get("work_episodes") or []),
                 "watched_episodes": list(record.get("watched_episodes") or []),
                 "expected_episodes": int(record.get("expected_episodes") or 0),

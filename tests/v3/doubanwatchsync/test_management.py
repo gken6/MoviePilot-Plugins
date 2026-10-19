@@ -96,10 +96,10 @@ def archive_record(plugin, key='movie@direct-a', subject='100'):
     return key
 
 
-def fake_client(monkeypatch, management, *, remove=True, write=True, detail=True):
+def fake_client(monkeypatch, management, *, remove=True, write=True, detail=True, kind="MOV"):
     client = management.DoubanClient(cookie='dbcl2=local; ck=local')
     client.login_state = Mock(return_value=True)
-    client.get_subject_info = Mock(return_value={'title': 'correct title', 'image': 'https://img.example.test/cover.jpg'} if detail else None)
+    client.get_subject_info = Mock(return_value={'title': 'correct title', 'image': 'https://img.example.test/cover.jpg', 'media_type': kind} if detail else None)
     client.set_status = Mock(return_value=write)
     client.remove_status = Mock(return_value=remove)
     calls = Mock()
@@ -302,7 +302,7 @@ def test_manual_status_is_validated_by_type(runtime, monkeypatch, media_type, st
     plugin._tv_completion = Mock(return_value={"complete":True,"known":True,"episodes":[1,2],"played":[1,2],"expected":2})
     key = 'pending'
     plugin.save_data('pending', {key: {'title': 'source', 'type': media_type, 'status': 'do'}})
-    client = fake_client(monkeypatch, management)
+    client = fake_client(monkeypatch, management, kind='TV' if media_type in ('TV','电视剧') else 'MOV')
     result = plugin.api_match({'key': key, 'subject_id': '200', 'status': status})
     assert result['success'] is valid
     if valid:
@@ -321,7 +321,7 @@ def test_manual_same_subject_can_change_in_progress_to_watched(runtime, monkeypa
     key = archive_record(plugin)
     archive = plugin.get_data('archive'); archive[key].update(type='电视剧', status='do')
     plugin.save_data('archive', archive)
-    client = fake_client(monkeypatch, management)
+    client = fake_client(monkeypatch, management, kind='TV')
     assert plugin.api_match({'key': key, 'subject_id': '100', 'status': 'collect'})['success']
     plugin._run_correction(key)
     client.set_status.assert_called_once_with('100', 'collect', True)
@@ -1235,7 +1235,7 @@ def test_manual_correction_with_no_local_cookie_can_use_cloud(runtime, monkeypat
     cm = sys.modules[runtime[2].__name__ + '.doubanclient']
     client = cm.DoubanClient('')
     client.login_state = Mock(side_effect=lambda: client.cookies.get('dbcl2') == 'cloud')
-    client.get_subject_info = Mock(return_value={'title': 'correct title', 'image': ''})
+    client.get_subject_info = Mock(return_value={'title': 'correct title', 'image': '', 'media_type': 'MOV'})
     client.set_status = Mock(return_value=True)
     client.remove_status = Mock(return_value=True)
     monkeypatch.setattr(management, 'DoubanClient', lambda **kwargs: client)
@@ -1541,7 +1541,7 @@ def test_second_episode_automatically_reuses_manual_id_without_search(runtime,mo
     plugin._subject_episode_count=Mock(return_value=2)
     plugin._play_state_of_any_user=Mock(return_value={15:True,16:True})
     plugin._search_subject=Mock(side_effect=AssertionError('must not search again'))
-    client=Mock();client.get_subject_image.return_value=''
+    client=Mock();client.get_subject_image.return_value='';client.get_subject_info.return_value={'title':'无悔的选择','media_type':'TV','episodes_count':2}
     monkeypatch.setattr(module,'DoubanClient',lambda **kwargs:client)
     plugin._write_douban=Mock(return_value=True)
     plugin._sync_item({'title':DOWN,'media_type':'TV','season':0,'episode':16,'server_name':'example-server','item_id':'example-series'})
@@ -1557,7 +1557,7 @@ def test_manual_watched_falls_back_to_in_progress_until_whole_work_is_complete(r
     plugin, management, _, _ = runtime
     key=archive_record(plugin)
     plugin.data['archive'][key].update(type='电视剧',status='do')
-    client=fake_client(monkeypatch,management)
+    client=fake_client(monkeypatch,management,kind='TV')
     plugin._tv_completion=Mock(return_value={'complete':False,'known':True,'episodes':[1,2],'played':[1],'expected':2})
     assert plugin.api_match({'key':key,'subject_id':'100','status':'collect'})['success']
     plugin._run_correction(key)
@@ -1592,6 +1592,7 @@ def test_new_episode_reader_strictly_filters_specials_and_keeps_missing(runtime)
 def test_rescan_uses_work_scope_and_only_corrects_confirmed_state(runtime,monkeypatch,original,complete,known,expected_write):
     plugin,management,module,_=runtime
     key=archive_record(plugin)
+    plugin.save_data('subject_details',{'100':{'title':'剧集','media_type':'TV','expires':9999999999}})
     plugin.data['archive'][key].update(type='电视剧',status=original,season=1,item_id='series')
     reader=Mock();reader.get_series_id.return_value='series';plugin._reader=Mock(return_value=reader)
     plugin._tv_completion=Mock(return_value={'complete':complete,'known':known,'episodes':[1,2],
@@ -1608,6 +1609,7 @@ def test_rescan_uses_work_scope_and_only_corrects_confirmed_state(runtime,monkey
 
 def test_retry_rechecks_stale_per_episode_watched_status(runtime):
     plugin=runtime[0]
+    plugin.save_data('subject_details',{'200':{'title':'剧集','media_type':'TV','expires':9999999999}})
     plugin.save_data('pending',{'show@mp-server':{'title':'剧集','source_title':'剧集','subject_id':'200','type':'TV',
         'status':'collect','season':1,'episode':2,'server_name':'mp-server','item_id':'series'}})
     plugin._fill_missing_images=Mock();plugin.retry_management=Mock()
@@ -1727,6 +1729,8 @@ def test_upgrade_clears_inferred_total_but_retains_confirmed_douban_total(runtim
 def cross_setup(runtime, *, season=1, expected=4, a_items=None, b_items=None, a_state=None, b_state=None):
     plugin = runtime[0]
     plugin._server = ['a', 'b']
+    plugin._skip_first = False
+    plugin.save_data('subject_details',{'200':{'title':'剧集','media_type':'TV','expires':9999999999}})
     def record(server):
         return {'title': '剧集', 'source_title': '剧集', 'type': '电视剧', 'subject_id': '200',
                 'status': 'do', 'season': season, 'episode': 1, 'item_id': server + '-series',
@@ -1981,3 +1985,196 @@ def test_cross_server_stale_id_does_not_relocate_to_same_title_with_other_subjec
     result = plugin._tv_completion(records['a'], readers['a'], '200')
     assert not result['complete'] and result['played'] == [3,4]
     assert result['servers'] == ['b']
+
+
+@pytest.mark.parametrize('metadata,expected',[
+    ({'type':'movie'},'MOV'),({'type':'tv'},'TV'),({'is_tv':False},'MOV'),({'is_tv':True},'TV'),
+    ({'episodes_count':3},'TV'),({'episodes_count':0},''),({'title':'电影名'},''),({'type':'unknown'},'')])
+def test_subject_type_requires_explicit_douban_evidence(runtime,metadata,expected):
+    cm=sys.modules[runtime[2].__name__+'.doubanclient']
+    assert cm.DoubanClient._detail_type(metadata)==expected
+
+
+def test_s00_movie_type_is_read_from_official_movie_page_not_tmdb_hint(runtime,monkeypatch):
+    cm=sys.modules[runtime[2].__name__+'.doubanclient']
+    page=Mock(status_code=200,text='<h1><span property="v:itemreviewed">完结篇 前篇</span></h1><div id="info">上映日期: 2023-03-04 片长: 61分钟</div>')
+    requests=Mock(return_value=Mock(get_res=Mock(return_value=page)))
+    monkeypatch.setattr(cm,'RequestUtils',requests)
+    result=cm.DoubanClient('ck=simulated').get_subject_info('35853587','TV')
+    assert result['media_type']=='MOV' and result['episodes_count']==0
+
+
+def test_missing_tv_count_does_not_make_a_tv_subject_a_movie(runtime,monkeypatch):
+    cm=sys.modules[runtime[2].__name__+'.doubanclient']
+    page=Mock(status_code=200,text='<h1><span property="v:itemreviewed">剧集</span></h1><div id="info">首播: 2026-10-19 单集片长: 45分钟</div><script type="application/ld+json">{"@type":"Movie"}</script>')
+    monkeypatch.setattr(cm,'RequestUtils',Mock(return_value=Mock(get_res=Mock(return_value=page))))
+    result=cm.DoubanClient().get_subject_info('200','MOV')
+    assert result['media_type']=='TV' and result['episodes_count']==0
+
+
+@pytest.mark.parametrize('values,expected', [(['wish','collect'],'MOV'),(['wish','do','collect'],'TV'),(['collect'],''),([], '')])
+def test_official_read_only_form_can_identify_subject_type(runtime,monkeypatch,values,expected):
+    cm=sys.modules[runtime[2].__name__+'.doubanclient']
+    response=Mock(status_code=200)
+    response.json.return_value={'html':'<form>'+''.join(f'<input name="interest" value="{value}">' for value in values)+'</form>'}
+    get=Mock(return_value=response);post=Mock(side_effect=AssertionError('read-only classification must not POST'))
+    monkeypatch.setattr(cm,'RequestUtils',Mock(return_value=Mock(get_res=get,post_res=post)))
+    assert cm.DoubanClient('ck=simulated')._form_subject_type('35853587')==expected
+    assert get.call_args.args[0]=='https://movie.douban.com/j/subject/35853587/interest'
+    post.assert_not_called()
+
+
+def movie_special(runtime,monkeypatch):
+    plugin,management,module,_=runtime
+    record={'title':'剧名 完结篇（上集）','source_title':'剧名 完结篇','type':'TV',
+        'season':0,'episode':36,'item_id':'series','server_name':'mp-server','user_name':'mp-user',
+        'status':'collect','expected_episodes':0,'watched_episodes':[36,37]}
+    key=plugin._archive_key(record['source_title'],'TV',0,'mp-server')
+    plugin.save_data('pending',{key:record})
+    client=fake_client(monkeypatch,management,kind='MOV')
+    client.get_subject_info.return_value.update(title='完结篇 前篇',episodes_count=0)
+    plugin._tv_completion=Mock(side_effect=AssertionError('a Douban movie has no TV completion check'))
+    return plugin,key,record,client
+
+
+def test_manual_s00_movie_writes_collect_and_isolates_following_episode(runtime,monkeypatch):
+    plugin,key,record,client=movie_special(runtime,monkeypatch)
+    assert plugin.api_match({'key':key,'subject_id':'35853587','status':'collect'})['success']
+    plugin._run_correction(key)
+    client.set_status.assert_called_once_with('35853587','collect',True)
+    exact=plugin._movie_episode_key(record)
+    result=plugin.get_data('archive')[exact]
+    assert key not in plugin.get_data('pending') and key not in plugin.get_data('manual_matches')
+    assert result['type']=='电影' and result['source_media_type']=='TV' and result['douban_type']=='MOV'
+    assert result['expected_episodes']==0 and result['watched_episodes']==[]
+    assert plugin._manual_subject(plugin._routing_key({**record,'media_type':'TV'}))=='35853587'
+    assert plugin._manual_subject(plugin._routing_key({**record,'episode':37,'media_type':'TV'}))==''
+    assert plugin.get_data('subject_type_backup_2.3.9')['pending'][key]['episode']==36
+
+
+def test_manual_in_progress_is_corrected_to_collect_for_douban_movie(runtime,monkeypatch):
+    plugin,key,record,client=movie_special(runtime,monkeypatch)
+    assert plugin.api_match({'key':key,'subject_id':'35853587','status':'do'})['success']
+    plugin._run_correction(key)
+    client.set_status.assert_called_once_with('35853587','collect',True)
+
+
+def test_s00_movie_failed_submission_keeps_precise_retry_binding(runtime,monkeypatch):
+    plugin,key,record,client=movie_special(runtime,monkeypatch)
+    client.set_status.return_value=False
+    plugin.api_match({'key':key,'subject_id':'35853587'});plugin._run_correction(key)
+    exact=plugin._movie_episode_key(record)
+    assert plugin.get_data('corrections')[exact]['state']=='failed'
+    assert plugin.get_data('manual_matches')[exact]['episode']==36
+    assert not plugin.get_data('archive')
+    assert plugin._routing_key({**record,'episode':37})!=exact
+
+
+@pytest.mark.parametrize('event,writes',[('PlaybackStart',False),('PlaybackStop',True)])
+def test_auto_s00_movie_never_sends_do(runtime,monkeypatch,event,writes):
+    plugin,key,record,client=movie_special(runtime,monkeypatch)
+    monkeypatch.setattr(runtime[2],'DoubanClient',Mock(return_value=client))
+    reader=Mock();reader.get_douban_id.return_value='35853587';plugin._reader=Mock(return_value=reader)
+    plugin._write_douban=Mock(return_value=True)
+    plugin._sync_item({**record,'media_type':'TV','event':event})
+    if writes:
+        assert plugin._write_douban.call_args.kwargs['status']=='collect'
+        assert plugin.get_data('archive')[plugin._movie_episode_key(record)]['type']=='电影'
+    else:
+        plugin._write_douban.assert_not_called()
+
+
+def test_retry_s00_movie_checks_only_the_corresponding_episode(runtime,monkeypatch):
+    plugin,key,record,client=movie_special(runtime,monkeypatch)
+    plugin.data['pending'][key]['subject_id']='35853587'
+    monkeypatch.setattr(runtime[2],'DoubanClient',Mock(return_value=client))
+    reader=Mock();reader.get_series_id.return_value='series';plugin._reader=Mock(return_value=reader)
+    plugin._is_played_by_any_user=Mock(return_value=True)
+    plugin._write_douban=Mock(return_value=True);plugin.retry_management=Mock();plugin._fill_missing_images=Mock()
+    plugin.retry_pending()
+    assert plugin._write_douban.call_args.kwargs['status']=='collect'
+    assert plugin._is_played_by_any_user.call_args.args[2]==36
+    assert plugin.get_data('archive')[plugin._movie_episode_key(record)]['type']=='电影'
+
+
+def test_unverified_douban_type_is_not_guessed_from_media_server(runtime,monkeypatch):
+    plugin,key,record,client=movie_special(runtime,monkeypatch)
+    client.get_subject_info.return_value={'title':'未知类型','episodes_count':0}
+    plugin._prepare_login=Mock(return_value=False)
+    plugin._write_douban=Mock(return_value=True)
+    plugin.api_match({'key':key,'subject_id':'35853587'});plugin._run_correction(key)
+    plugin._write_douban.assert_not_called()
+    assert '类型' in plugin.get_data('corrections')[key]['message']
+
+
+def test_subject_type_cache_survives_failed_refresh(runtime,monkeypatch):
+    plugin,key,record,client=movie_special(runtime,monkeypatch)
+    plugin.save_data('subject_details',{'35853587':{'title':'前篇','media_type':'MOV','expires':0}})
+    client.get_subject_info.return_value=None
+    assert plugin._subject_detail(client,'35853587','TV')['media_type']=='MOV'
+
+
+def test_code_upgrade_keeps_old_failed_manual_sync_for_user_retry(runtime):
+    plugin=runtime[0]
+    plugin.data.pop('subject_type_failures_v1',None)
+    plugin.save_data('corrections',{'old':{'state':'failed','record':{'type':'TV'},'subject_id':'35853587'}})
+    plugin._defer_old_type_failures()
+    plugin._queue_correction=Mock()
+    plugin.retry_management()
+    plugin._queue_correction.assert_not_called()
+    assert plugin.get_data('corrections')['old']['manual_retry_only']
+
+
+def test_rescan_old_s00_tv_record_uses_douban_movie_type(runtime,monkeypatch):
+    plugin,key,record,client=movie_special(runtime,monkeypatch)
+    plugin.save_data('pending',{})
+    plugin.save_data('archive',{key:{**record,'type':'电视剧','subject_id':'35853587','status':'do'}})
+    monkeypatch.setattr(runtime[2],'DoubanClient',Mock(return_value=client))
+    reader=Mock();reader.get_series_id.return_value='series';plugin._reader=Mock(return_value=reader)
+    plugin._is_played_by_any_user=Mock(return_value=True)
+    plugin._write_douban=Mock(return_value=True)
+    result=plugin.rescan_archive()
+    assert result['upgraded']==1
+    assert plugin._write_douban.call_args.kwargs['status']=='collect'
+    assert plugin.get_data('archive')[plugin._movie_episode_key(record)]['type']=='电影'
+
+
+def test_precise_movie_no_entry_rule_does_not_block_next_special(runtime,monkeypatch):
+    plugin,key,record,client=movie_special(runtime,monkeypatch)
+    plugin.api_match({'key':key,'subject_id':'35853587'});plugin._run_correction(key)
+    exact=plugin._movie_episode_key(record)
+    plugin.api_match({'key':exact,'action':'ignore'})
+    assert plugin._manual_guard(plugin._routing_key(record))
+    assert not plugin._manual_guard(plugin._routing_key({**record,'episode':37}))
+
+
+def test_user_can_explicitly_retry_deferred_type_failure(runtime,monkeypatch):
+    plugin,key,record,client=movie_special(runtime,monkeypatch)
+    plugin.api_match({'key':key,'subject_id':'35853587'})
+    op=plugin.data['corrections'][key];op['state']='failed';op['manual_retry_only']=True
+    assert plugin.api_match({'key':key,'action':'retry'})['success']
+    assert not plugin.get_data('corrections')[key].get('manual_retry_only')
+    plugin._run_correction(key)
+    client.set_status.assert_called_once_with('35853587','collect',True)
+
+
+def test_pending_type_error_can_be_retried_without_existing_correction(runtime,monkeypatch):
+    plugin,key,record,client=movie_special(runtime,monkeypatch)
+    plugin.data['pending'][key].update(subject_id='35853587',error='无法确认豆瓣条目类型')
+    assert plugin.api_match({'key':key,'action':'retry'})['success']
+    plugin._run_correction(key)
+    client.set_status.assert_called_once_with('35853587','collect',True)
+
+
+@pytest.mark.parametrize('kind,writes',[('MOV',True),('TV',False)])
+def test_first_episode_filter_uses_douban_type_not_s00_location(runtime,monkeypatch,kind,writes):
+    plugin,key,record,client=movie_special(runtime,monkeypatch)
+    record.update(episode=1)
+    client.get_subject_info.return_value['media_type']=kind
+    monkeypatch.setattr(runtime[2],'DoubanClient',Mock(return_value=client))
+    reader=Mock();reader.get_douban_id.return_value='35853587';plugin._reader=Mock(return_value=reader)
+    plugin._write_douban=Mock(return_value=True)
+    plugin._skip_first=True
+    plugin._sync_item({**record,'media_type':'TV','event':'PlaybackStop'})
+    assert plugin._write_douban.called is writes
+    if writes:assert plugin._write_douban.call_args.kwargs['status']=='collect'

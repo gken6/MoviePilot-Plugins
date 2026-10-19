@@ -226,7 +226,7 @@ export const Page = defineComponent({
         h('div', { class: 'dw-record-list' }, filtered.value.length ? filtered.value.slice((page.value - 1) * 15, page.value * 15).map(record => h('article', { class: 'dw-record', key: record.key }, [
           h('div', { class: 'dw-record-poster' }, [h('span', { 'aria-hidden': 'true' }, (record.title || '').slice(0, 2)), record.image && h('img', { src: record.image, alt: `${record.title || '影片'}海报`, loading: 'lazy', onLoad: event => { event.target.style.display = ''; }, onError: event => { event.target.style.display = 'none'; } })]),
           h('div', { class: 'dw-record-copy' }, [h('strong', record.subject_name || record.title || record.source_title), h('div', { class: 'dw-record-meta' }, [
-            h('span', record.type === 'TV' ? '电视剧' : record.type === 'MOV' ? '电影' : record.type), record.season ? h('span', `第${record.season}季`) : null,
+            h('span', record.type === 'TV' ? '电视剧' : record.type === 'MOV' ? '电影' : record.type), /^(TV|电视剧)/.test(record.type || '') && record.season ? h('span', `第${record.season}季`) : null,
             record.expected_episodes ? h('span', `${(record.progress_servers || []).length > 1 ? '合并已看' : '已看'} ${(record.watched_episodes || []).length}/${record.expected_episodes} 集`) : /^(TV|电视剧)/.test(record.type || '') ? h('span', '总集数待获取') : null,
             h('span', record.server_name || '媒体服务器'), (record.progress_servers || []).length > 1 ? h('span', { title: record.progress_servers.join('、') }, `${record.progress_servers.length} 台服务器合并进度`) : null, statusNames[record.status] ? h('span', { class: record.status === 'collect' ? 'dw-text-good' : '' }, statusNames[record.status]) : null,
             record.manual ? h('span', '手动匹配') : null,
@@ -248,7 +248,7 @@ export const Page = defineComponent({
           h('div', { class: 'dw-choice' }, [button('指定豆瓣编号', () => mode.value = 'sync', { primary: mode.value === 'sync' }), button('无条目', () => mode.value = 'ignore', { primary: mode.value === 'ignore' })]),
           mode.value === 'sync' ? h('div', [field('豆瓣编号', subject.value, value => subject.value = value, { placeholder: '例如 1292052', enter: submit }),
             h('span', { class: 'dw-subtle' }, '同步到豆瓣的状态'),
-            statusOptions(selected.value).length > 1 ? h('p', { class: 'dw-subtle' }, '剧集会按各服务器合并后的逐集进度校正状态：全部看完为看过，否则为在看；编号会保存复用。') : null,
+            statusOptions(selected.value).length > 1 ? h('p', { class: 'dw-subtle' }, '最终按豆瓣条目类型处理：影片仅同步看过；剧集按各服务器合并后的逐集进度判断。S00 中的影片只绑定当前单集。') : null,
             h('div', { class: 'dw-choice', role: 'group', 'aria-label': '同步状态' }, statusOptions(selected.value).map(value => button(statusNames[value], () => interest.value = value, { primary: interest.value === value }))),
             /^\d+$/.test(subject.value) ? h('a', { class: 'dw-preview-link', href: `https://movie.douban.com/subject/${subject.value}/`, target: '_blank', rel: 'noopener noreferrer' }, '查看对应豆瓣条目 ↗') : null,
             h('p', { class: 'dw-subtle' }, selected.value.subject_id && selected.value.subject_id !== subject.value ? `会将新条目标记为“${statusNames[interest.value]}”，并撤销原编号 ${selected.value.subject_id} 的错误标记；未完成会保留待处理提示。` : `将重新向豆瓣提交“${statusNames[interest.value]}”状态。`)]) : h('p', { class: 'dw-subtle' }, '停止自动匹配并移入“无条目”。若原来已同步，也会撤销旧条目的错误标记。以后可以随时恢复。'),

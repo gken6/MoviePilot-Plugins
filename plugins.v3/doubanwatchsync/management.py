@@ -166,6 +166,7 @@ class WatchManagement:
         return "vue", "frontend/dist/assets"
 
     def _management_init(self, config: dict) -> None:
+        self._defer_old_type_failures()
         self._migrate_work_records()
         self._clear_inferred_totals()
         with self._lock:
@@ -200,8 +201,9 @@ class WatchManagement:
         for identifier, item in records.items():
             if item.get("enabled", True) and (not item.get("token") or item.get("movies") is None):
                 self._queue_server_check(identifier)
-        for key in (self.get_data(CORRECTIONS) or {}):
-            self._queue_correction(key)
+        for key, operation in (self.get_data(CORRECTIONS) or {}).items():
+            if not operation.get("manual_retry_only"):
+                self._queue_correction(key)
         self._queue_combined_progress()
         progress_keys = self.get_data("work_progress_pending") or []
         if progress_keys:
@@ -257,7 +259,7 @@ class WatchManagement:
                         missing_images.add(image)
                 result.append({"key": key, **record, "image": poster,
                                "manual": bool((overrides.get(key) or {}).get("subject_id")),
-                               "operation": operation.get("message", ""),
+                               "operation": operation.get("message") or record.get("error") or "",
                                "processing": operation.get("state") == "running",
                                "needs_cleanup": bool(operation.get("cleanup_ids")),
                                "target_id": operation.get("subject_id", ""),
@@ -520,7 +522,13 @@ class WatchManagement:
                 self.save_data(OVERRIDES, overrides)
                 self._clear_record_poll(record)
                 return {"success": True, "message": "已移回待同步，将重新自动匹配"}
+            if action == "retry" and not corrections.get(key):
+                if not record.get("subject_id"):
+                    return {"success": False, "message": "请先指定豆瓣编号"}
+                data = {**data, "subject_id": str(record["subject_id"])}
+                action = "sync"
             if action == "retry" and corrections.get(key):
+                corrections[key].pop("manual_retry_only", None)
                 corrections[key]["state"] = "running"
                 corrections[key]["message"] = "正在重新同步"
             else:
@@ -600,8 +608,14 @@ class WatchManagement:
                     subject = operation["subject_id"]
                     media_type = "TV" if str(record.get("type") or "").startswith(("TV", "电视剧")) else "MOV"
                     # 验证真实条目，避免把任意数字当成有效豆瓣编号。
-                    detail = client.get_subject_info(subject, media_type)
+                    detail = self._subject_detail(client, subject, media_type)
                     completion = None
+                    if detail:
+                        media_type = detail["media_type"]
+                        key, record = self._bind_subject_kind(key, record, media_type)
+                        operation["record"] = record
+                        if media_type == "MOV":
+                            record = {**record, "status": "collect"}
                     if detail and media_type == "TV":
                         self._remember_subject_info(subject, detail)
                         completion = self._tv_completion(
@@ -614,11 +628,13 @@ class WatchManagement:
                     if message:
                         pass
                     elif not detail:
-                        message = "无法读取该豆瓣条目，请核对编号或稍后重试"
+                        message = "无法确认该豆瓣条目的类型，请核对编号或稍后重试"
                     elif self._write_douban(client, "set_status", subject, record.get("status") or "do", self._private):
                         payload = {"episode": record.get("episode", 0), "item_id": record.get("item_id", ""),
                                    "server_name": record.get("server_name", ""), "user_name": record.get("user_name", ""),
-                                   "title": record.get("source_title") or record.get("title") or "", "direct_id": record.get("direct_id") or ""}
+                                   "title": record.get("source_title") or record.get("title") or "", "direct_id": record.get("direct_id") or "",
+                                   "source_media_type": record.get("source_media_type") or record.get("type") or "",
+                                   "douban_type": media_type}
                         if completion is not None:
                             payload.update(progress_fields(completion))
                         title = str(detail.get("title") or record.get("subject_name") or record.get("title") or key)
@@ -674,8 +690,9 @@ class WatchManagement:
 
     def retry_management(self) -> None:
         """重试人工修正任务和失败直连登录，停用的服务器不访问。"""
-        for key in (self.get_data(CORRECTIONS) or {}):
-            self._queue_correction(key)
+        for key, operation in (self.get_data(CORRECTIONS) or {}).items():
+            if not operation.get("manual_retry_only"):
+                self._queue_correction(key)
         for identifier, item in (self.get_data(SERVERS) or {}).items():
             if item.get("enabled", True) and item.get("status") != "正在获取token":
                 self._queue_server_check(identifier)
@@ -686,8 +703,7 @@ class WatchManagement:
             return self._record_locks.setdefault(key, threading.RLock())
 
     def _sync_item(self, payload: dict) -> None:
-        key = self._archive_key(payload.get("title") or "", payload.get("media_type") or "",
-                                int(payload.get("season") or 0), payload.get("server_name"))
+        key = self._routing_key(payload)
         with self._sync_lock, self._get_record_lock(key):
             if not self._enabled or self._manual_guard(key) or not self._direct_record_allowed(payload):
                 return
@@ -707,14 +723,11 @@ class WatchManagement:
         # A direct account is isolated from the MP username allowlist.
         if server.get("username") and payload.get("user_name") != server["username"]:
             return False
-        if payload.get("media_type") == "TV" and self._skip_first and payload.get("episode") == 1:
-            return False
         reader = self._reader(server["name"], username=server.get("username"), user_id=server.get("user_id"))
         if self._exclude:
             if not self._is_allowed_path(reader.get_item_path(payload.get("item_id") or "")):
                 return False
-        key = self._archive_key(payload.get("title") or "", payload.get("media_type") or "",
-                                int(payload.get("season") or 0), server["name"])
+        key = self._routing_key(payload)
         return not self._manual_guard(key)
 
     def _run_correction(self, key: str) -> None:
