@@ -164,3 +164,45 @@ def test_account_management_endpoints_require_admin(runtime):
         module.require_manager(types.SimpleNamespace(super_user=False))
     assert error.value.status_code == 403
     module.require_manager(types.SimpleNamespace(super_user=True))
+
+
+def test_dependency_failure_is_rechecked_before_client_creation(runtime, monkeypatch):
+    plugin, module, _ = runtime
+    plugin.init_plugin({'api_id':'12345','api_hash':'simulated','proxy_type':'none'})
+    ready_socks=module.socks
+    factory=Mock(return_value=object())
+    monkeypatch.setattr(module,'socks',None)
+    monkeypatch.setattr(module,'TelegramClient',None)
+    importer=Mock(return_value=(ready_socks,factory,Exception,Exception))
+    monkeypatch.setattr(module,'_import_telegram_deps',importer)
+    result=plugin._TgUniversalSign__client()
+    assert result is factory.return_value
+    importer.assert_called_once()
+    assert factory.call_args.args[1:]==(12345,'simulated')
+
+
+def test_ready_dependencies_do_not_reimport_on_every_operation(runtime,monkeypatch):
+    _,module,_=runtime
+    importer=Mock(side_effect=AssertionError('already ready'))
+    monkeypatch.setattr(module,'_import_telegram_deps',importer)
+    assert module._refresh_telegram_deps()
+    importer.assert_not_called()
+
+
+def test_dependency_check_can_recover_after_an_initial_failed_retry(runtime,monkeypatch):
+    _,module,_=runtime
+    ready_socks=module.socks;ready_client=module.TelegramClient
+    monkeypatch.setattr(module,'socks',None);monkeypatch.setattr(module,'TelegramClient',None)
+    importer=Mock(side_effect=[(None,None,Exception,Exception),(ready_socks,ready_client,Exception,Exception)])
+    monkeypatch.setattr(module,'_import_telegram_deps',importer)
+    assert not module._refresh_telegram_deps()
+    assert module._refresh_telegram_deps()
+    assert importer.call_count==2
+
+
+def test_import_error_names_the_missing_module_without_account_details(runtime,monkeypatch):
+    _,module,_=runtime
+    monkeypatch.setitem(sys.modules,'telethon',None)
+    values=module._import_telegram_deps()
+    assert values[:2]==(None,None)
+    assert module._TELEGRAM_IMPORT_ERROR=='telethon'

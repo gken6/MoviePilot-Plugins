@@ -33,7 +33,7 @@
   "TgUniversalSign": {
     "name": "TG万能签到",
     "description": "使用 TG 个人账号逐行执行命令、等待和按钮点击，支持定时、代理、通知及七天运行历史。",
-    "version": "0.3.2",
+    "version": "0.3.3",
     "author": "gken6",
     "level": 2,
     "icon": "https://raw.githubusercontent.com/gken6/MoviePilot-Plugins/main/icons/tguniversalsign.svg",
@@ -42,6 +42,7 @@
     "plugin_schema_version": 1,
     "release": false,
     "history": {
+      "0.3.3": "修复启动时依赖尚未就绪导致永久报告缺失；使用前重新检测 Telethon/PySocks，依赖恢复后无需重新登录。",
       "0.3.2": "首次公开发布，移除私人代理默认值，适配 V3 SDK、依赖声明、持久数据目录及管理员登录接口。",
       "0.3.1": "逐行动作执行、按钮匹配、代理、通知和七天历史。"
     }

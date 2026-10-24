@@ -59,3 +59,9 @@ https://github.com/gken6/MoviePilot-Plugins
 - 0.3.1：来自 NAS 当前运行版本；支持逐行动作、按钮匹配和七天历史。
 
 来源归属见 [NOTICE.md](NOTICE.md)。发布前的验证使用模拟 Telegram 客户端，没有登录真实账号或发送真实消息。
+
+## 依赖恢复
+
+容器重建后，MP 主服务可能先于 Telegram 依赖安装完成。插件启动时的导入失败不会再永久保留；每次创建客户端前重新检测，已就绪时不重复导入。依赖安装完成后可以直接重试，已有 Telegram session 和账号配置继续使用，不需要重新发送验证码。
+
+依赖仍通过 `pyproject.toml` 交给 MoviePilot 管理，插件不自行运行 pip，也不在启动时触发签到或登录。仍未就绪时提示具体缺失的模块名，避免把全部情况笼统归为 telethon 和 python-socks 缺失。

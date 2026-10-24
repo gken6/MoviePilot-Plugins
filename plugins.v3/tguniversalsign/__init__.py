@@ -7,17 +7,36 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
+_TELEGRAM_IMPORT_ERROR = ""
+
+
 def _import_telegram_deps():
+    """
+    检测 Telegram 依赖，并记录不含凭据的失败类型。
+    """
+    global _TELEGRAM_IMPORT_ERROR
     try:
         import socks as socks_mod
         from telethon import TelegramClient as client_cls
         from telethon.errors import FloodWaitError as flood_cls, SessionPasswordNeededError as password_cls
+        _TELEGRAM_IMPORT_ERROR = ""
         return socks_mod, client_cls, flood_cls, password_cls
-    except ImportError:
+    except ImportError as error:
+        _TELEGRAM_IMPORT_ERROR = getattr(error, "name", None) or type(error).__name__
         return None, None, Exception, Exception
 
 
 socks, TelegramClient, FloodWaitError, SessionPasswordNeededError = _import_telegram_deps()
+
+
+def _refresh_telegram_deps() -> bool:
+    """
+    首次加载早于依赖安装时，在下一次使用前重新检测。
+    """
+    global socks, TelegramClient, FloodWaitError, SessionPasswordNeededError
+    if socks is None or TelegramClient is None:
+        socks, TelegramClient, FloodWaitError, SessionPasswordNeededError = _import_telegram_deps()
+    return socks is not None and TelegramClient is not None
 
 from apscheduler.triggers.cron import CronTrigger
 from app.sdk.logging import logger
@@ -37,7 +56,7 @@ class TgUniversalSign(_PluginBase):
     plugin_name = "TG万能签到"
     plugin_desc = "使用 TG 个人账号，按频道逐行执行自定义命令。"
     plugin_icon = "https://raw.githubusercontent.com/gken6/MoviePilot-Plugins/main/icons/tguniversalsign.svg"
-    plugin_version = "0.3.2"
+    plugin_version = "0.3.3"
     plugin_author = "gken6"
     author_url = "https://github.com/gken6"
     plugin_config_prefix = "tguniversalsign_"
@@ -267,15 +286,21 @@ class TgUniversalSign(_PluginBase):
         self.update_config(self.__config_dict())
 
     def __proxy(self):
+        """
+        读取已配置的代理，不连接 Telegram。
+        """
         if self._proxy_type == "none" or not self._proxy_host or not self._proxy_port:
             return None
-        if socks is None:
-            raise RuntimeError("缺少依赖：telethon / PySocks")
+        if socks is None and not _refresh_telegram_deps():
+            raise RuntimeError("依赖尚未就绪：" + (_TELEGRAM_IMPORT_ERROR or "Telethon / PySocks"))
         return (socks.SOCKS5 if self._proxy_type == "socks5" else socks.HTTP, self._proxy_host, int(self._proxy_port))
 
     def __client(self):
-        if TelegramClient is None:
-            raise RuntimeError("缺少依赖：请安装 telethon 和 python-socks")
+        """
+        确认依赖后创建客户端，保留已有登录会话。
+        """
+        if not _refresh_telegram_deps():
+            raise RuntimeError("依赖尚未就绪：" + (_TELEGRAM_IMPORT_ERROR or "Telethon / PySocks") + "；依赖安装完成后可直接重试")
         if not self._api_id or not self._api_hash:
             raise RuntimeError("请先配置 Telegram API ID / API Hash")
         return TelegramClient(str(self._session_path), int(self._api_id), self._api_hash, proxy=self.__proxy())
