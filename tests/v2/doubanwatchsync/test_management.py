@@ -358,7 +358,7 @@ def test_missing_match_preserves_resolved_mp_watch_status(runtime, monkeypatch):
     monkeypatch.setattr(plugin, '_reader', lambda *args, **kwargs: Mock(get_douban_id=Mock(return_value='')))
     monkeypatch.setattr(plugin, '_user_id_for', lambda *args: None)
     monkeypatch.setattr(plugin, '_resolve_status', lambda *args: 'collect')
-    monkeypatch.setattr(plugin, '_search_subject', lambda *args: (None, None))
+    monkeypatch.setattr(plugin, '_match_subject', lambda *args: (None, None))
     plugin._sync_item_original({'title': 'source', 'media_type': 'MOV', 'server_name': 'mp-server'})
     assert next(iter(plugin.data['pending'].values()))['status'] == 'collect'
 
@@ -1597,7 +1597,7 @@ def test_second_episode_automatically_reuses_manual_id_without_search(runtime,mo
     plugin._reader=Mock(return_value=reader)
     plugin._subject_episode_count=Mock(return_value=2)
     plugin._play_state_of_any_user=Mock(return_value={15:True,16:True})
-    plugin._search_subject=Mock(side_effect=AssertionError('must not search again'))
+    plugin._match_subject=Mock(side_effect=AssertionError('must not search again'))
     client=Mock();client.get_subject_image.return_value='';client.get_subject_info.return_value={'title':'无悔的选择','media_type':'TV','episodes_count':2}
     monkeypatch.setattr(module,'DoubanClient',lambda **kwargs:client)
     plugin._write_douban=Mock(return_value=True)
@@ -1655,6 +1655,7 @@ def test_rescan_uses_work_scope_and_only_corrects_confirmed_state(runtime,monkey
     plugin._tv_completion=Mock(return_value={'complete':complete,'known':known,'episodes':[1,2],
         'played':[1,2] if complete else [1],'expected':2})
     plugin._write_douban=Mock(return_value=True)
+    plugin._match_subject=Mock(side_effect=lambda record,reader: (record.get('title'),record.get('subject_id')))
     summary=plugin.rescan_archive()
     if expected_write:
         assert plugin._write_douban.call_args.kwargs['status']==expected_write
@@ -1675,6 +1676,7 @@ def test_retry_rechecks_stale_per_episode_watched_status(runtime):
     plugin._subject_episode_count=Mock(return_value=2)
     plugin._play_state_of_any_user=Mock(return_value={1:False,2:True})
     plugin._write_douban=Mock(return_value=True)
+    reader.get_match_metadata.return_value={};reader.get_douban_id.return_value='200'
     plugin.retry_pending()
     assert plugin._write_douban.call_args.kwargs['status']=='do'
     assert plugin.get_data('archive')['show@mp-server']['status']=='do'
@@ -2131,7 +2133,7 @@ def test_s00_movie_failed_submission_keeps_precise_retry_binding(runtime,monkeyp
 def test_auto_s00_movie_never_sends_do(runtime,monkeypatch,event,writes):
     plugin,key,record,client=movie_special(runtime,monkeypatch)
     monkeypatch.setattr(runtime[2],'DoubanClient',Mock(return_value=client))
-    reader=Mock();reader.get_douban_id.return_value='35853587';plugin._reader=Mock(return_value=reader)
+    reader=Mock();reader.get_douban_id.return_value='35853587';reader.get_match_metadata.return_value={'douban_id':'35853587','scope':'episode'};plugin._reader=Mock(return_value=reader)
     plugin._write_douban=Mock(return_value=True)
     plugin._sync_item({**record,'media_type':'TV','event':event})
     if writes:
@@ -2148,6 +2150,7 @@ def test_retry_s00_movie_checks_only_the_corresponding_episode(runtime,monkeypat
     reader=Mock();reader.get_series_id.return_value='series';plugin._reader=Mock(return_value=reader)
     plugin._is_played_by_any_user=Mock(return_value=True)
     plugin._write_douban=Mock(return_value=True);plugin.retry_management=Mock();plugin._fill_missing_images=Mock()
+    reader.get_match_metadata.return_value={'douban_id':'35853587','scope':'episode'};reader.get_douban_id.return_value='35853587'
     plugin.retry_pending()
     assert plugin._write_douban.call_args.kwargs['status']=='collect'
     assert plugin._is_played_by_any_user.call_args.args[2]==36
@@ -2190,6 +2193,7 @@ def test_rescan_old_s00_tv_record_uses_douban_movie_type(runtime,monkeypatch):
     reader=Mock();reader.get_series_id.return_value='series';plugin._reader=Mock(return_value=reader)
     plugin._is_played_by_any_user=Mock(return_value=True)
     plugin._write_douban=Mock(return_value=True)
+    plugin._match_subject=Mock(side_effect=lambda record,reader: (record.get('title'),record.get('subject_id')))
     result=plugin.rescan_archive()
     assert result['upgraded']==1
     assert plugin._write_douban.call_args.kwargs['status']=='collect'
@@ -2229,9 +2233,390 @@ def test_first_episode_filter_uses_douban_type_not_s00_location(runtime,monkeypa
     record.update(episode=1)
     client.get_subject_info.return_value['media_type']=kind
     monkeypatch.setattr(runtime[2],'DoubanClient',Mock(return_value=client))
-    reader=Mock();reader.get_douban_id.return_value='35853587';plugin._reader=Mock(return_value=reader)
+    reader=Mock();reader.get_douban_id.return_value='35853587';reader.get_match_metadata.return_value={'douban_id':'35853587','scope':'episode'};plugin._reader=Mock(return_value=reader)
     plugin._write_douban=Mock(return_value=True)
     plugin._skip_first=True
     plugin._sync_item({**record,'media_type':'TV','event':'PlaybackStop'})
     assert plugin._write_douban.called is writes
     if writes:assert plugin._write_douban.call_args.kwargs['status']=='collect'
+
+
+@pytest.mark.parametrize('special', [False, True])
+def test_match_metadata_uses_series_ids_for_tv_and_episode_ids_for_special(runtime, monkeypatch, special):
+    mm = sys.modules[runtime[2].__name__ + '.mediaserver']
+    reader = mm.MediaServerReader()
+    episode = {'Id':'ep','Type':'Episode','Name':'第3集','SeriesId':'show',
+               'ProviderIds':{'IMDB':'tt9999','Tmdb':'9000'}}
+    series = {'Id':'show','Type':'Series','Name':'魔女嘉莉','ProductionYear':2026,
+              'ProviderIds':{'Imdb':'tt11540908','Tmdb':'288673'}}
+    monkeypatch.setattr(reader, 'get_item', lambda key: {'ep':episode,'show':series}.get(key, {}))
+    found = reader.get_match_metadata('ep', 'TV', 0 if special else 1, 3)
+    assert found['imdb_id'] == ('tt9999' if special else 'tt11540908')
+    assert found['tmdb_id'] == ('9000' if special else '288673')
+    assert found['scope'] == ('episode' if special else 'series')
+
+
+def test_series_event_resolves_exact_special_before_using_identifiers(runtime, monkeypatch):
+    mm = sys.modules[runtime[2].__name__ + '.mediaserver']
+    reader = mm.MediaServerReader()
+    items = {'show':{'Id':'show','Type':'Series','ProviderIds':{'Imdb':'tt1111'}},
+             'ep':{'Id':'ep','Type':'Episode','ProviderIds':{'Imdb':'tt2222'}}}
+    monkeypatch.setattr(reader, 'get_item', lambda key: items.get(key, {}))
+    reader.get_season_episode_items = Mock(return_value=[{'Id':'ep','IndexNumber':36}])
+    assert reader.get_match_metadata('show','TV',0,36)['imdb_id'] == 'tt2222'
+    assert reader.get_match_metadata('show','TV',0,37) == {}
+
+
+def test_missing_series_does_not_use_an_ordinary_episode_as_the_tv_work(runtime, monkeypatch):
+    mm = sys.modules[runtime[2].__name__ + '.mediaserver']
+    reader = mm.MediaServerReader()
+    reader.get_item = Mock(return_value={'Type':'Episode','ProviderIds':{'Imdb':'tt9999'}})
+    assert reader.get_match_metadata('ep','TV',1,3) == {}
+
+
+@pytest.mark.parametrize('raw,expected', [('37083974','37083974'),
+    ('https://api.douban.com/movie/37083974','37083974'),
+    ('https://movie.douban.com/subject/37083974/','37083974'),
+    ('https://other.example/movie/37083974',None),('tt11540908',None)])
+def test_imdb_lookup_parses_only_documented_douban_identifiers(runtime, monkeypatch, raw, expected):
+    cm = sys.modules[runtime[2].__name__ + '.doubanclient']
+    module = types.ModuleType('app.modules.douban.apiv2')
+    api = Mock(); api.imdbid.return_value = {'id':raw,'title':'Carrie'}
+    module.DoubanApi = Mock(return_value=api)
+    monkeypatch.setitem(sys.modules, 'app.modules.douban.apiv2', module)
+    title, subject = cm.DoubanClient().find_by_imdb('tt11540908')
+    assert subject == expected
+    api.imdbid.assert_called_once_with('tt11540908')
+
+
+def test_imdb_lookup_rejects_a_response_with_conflicting_external_id(runtime, monkeypatch):
+    cm = sys.modules[runtime[2].__name__ + '.doubanclient']
+    module = types.ModuleType('app.modules.douban.apiv2')
+    api = Mock(); api.imdbid.return_value = {'id':'1292664','title':'Carrie','attrs':{'imdb':['tt0074285']}}
+    module.DoubanApi = Mock(return_value=api)
+    monkeypatch.setitem(sys.modules, 'app.modules.douban.apiv2', module)
+    assert cm.DoubanClient().find_by_imdb('tt11540908') == (None, None)
+
+
+def matching_reader(**metadata):
+    """
+    只模拟影视元数据，禁止测试意外使用服务器的豆瓣编号兜底。
+    """
+    return Mock(get_match_metadata=Mock(return_value=metadata),
+                get_douban_id=Mock(side_effect=AssertionError('must not fall back to another subject')))
+
+
+def test_carrie_imdb_identity_wins_over_old_movie_id_and_same_title(runtime, monkeypatch):
+    plugin, _, module, _ = runtime
+    mm = sys.modules[module.__name__ + '.matching']
+    client = Mock(); client.find_by_imdb.return_value = ('Carrie','37083974')
+    monkeypatch.setattr(mm,'DoubanClient',Mock(return_value=client))
+    payload = {'title':'魔女嘉莉','media_type':'TV','season':1,'episode':3,
+               'item_id':'ep','subject_id':'1292664'}
+    reader = matching_reader(imdb_id='tt11540908',tmdb_id='288673',media_type='TV',scope='series')
+    assert plugin._match_subject(payload, reader) == ('Carrie','37083974')
+    assert payload['matched_imdb'] == 'tt11540908' and payload['match_method'] == 'imdb'
+    client.find_by_imdb.assert_called_once_with('tt11540908')
+    assert plugin._match_subject(dict(payload),reader)[1] == '37083974'
+    assert client.find_by_imdb.call_count == 1
+
+
+def test_failed_identifier_lookup_does_not_search_same_title_or_accept_old_subject(runtime, monkeypatch):
+    plugin, _, module, _ = runtime
+    mm = sys.modules[module.__name__ + '.matching']
+    client = Mock(); client.find_by_imdb.return_value = (None, None)
+    client.search = Mock(side_effect=AssertionError('no title fallback'))
+    monkeypatch.setattr(mm,'DoubanClient',Mock(return_value=client))
+    reader = matching_reader(imdb_id='tt11540908',scope='series')
+    payload = {'title':'魔女嘉莉','media_type':'TV','season':1,'subject_id':'1292664'}
+    assert plugin._match_subject(payload, reader) == (None, None)
+    assert '编号' in payload['subject_error']
+    client.search.assert_not_called()
+    assert not plugin.get_data('identifier_matches')
+
+
+@pytest.mark.parametrize('media_type,expected', [('TV','tv'),('MOV','movie')])
+def test_tmdb_conversion_preserves_type_namespace_and_verifies_returned_id(runtime,monkeypatch,media_type,expected):
+    plugin, _, module, _ = runtime
+    chain = types.ModuleType('app.sdk.chain' if 'plugins.v3' in str(ROOT) else 'app.chain')
+    api = Mock(); api.tmdb_info.return_value = {'id':123,'external_ids':{'imdb_id':'tt456'}}
+    chain.ChainBase = Mock(return_value=api)
+    monkeypatch.setitem(sys.modules,chain.__name__,chain)
+    monkeypatch.setattr(sys.modules['app.schemas.types'],'MediaType',types.SimpleNamespace(TV='tv',MOVIE='movie'),raising=False)
+    metadata = {'tmdb_id':'123','media_type':media_type,'scope':'series' if media_type=='TV' else 'movie'}
+    assert plugin._tmdb_imdb(metadata) == 'tt456'
+    api.tmdb_info.assert_called_once_with(tmdbid=123,mtype=expected)
+    api.tmdb_info.return_value['id'] = 789
+    assert plugin._tmdb_imdb(metadata) == ''
+
+
+def test_tmdb_only_metadata_is_converted_before_douban_lookup(runtime,monkeypatch):
+    plugin, _, module, _ = runtime
+    mm = sys.modules[module.__name__ + '.matching']
+    client = Mock(); client.find_by_imdb.return_value = ('Carrie','37083974')
+    monkeypatch.setattr(mm,'DoubanClient',Mock(return_value=client))
+    plugin._tmdb_imdb = Mock(return_value='tt11540908')
+    reader = matching_reader(tmdb_id='288673',media_type='TV',scope='series')
+    payload = {'title':'魔女嘉莉','media_type':'TV','season':1}
+    assert plugin._match_subject(payload,reader)[1] == '37083974'
+    assert payload['match_method'] == 'tmdb_imdb'
+    client.find_by_imdb.assert_called_once_with('tt11540908')
+
+
+@pytest.mark.parametrize('season,title,accepted', [(1,'Show 第二季',False),(2,'Show',False),
+    (2,'Show 第一季',False),(2,'Show 第二季',True),(3,'Show Season 3',True)])
+def test_series_imdb_cannot_be_silently_reused_for_another_season(runtime,monkeypatch,season,title,accepted):
+    plugin, _, module, _ = runtime
+    mm = sys.modules[module.__name__ + '.matching']
+    client = Mock(); client.find_by_imdb.return_value = (title,'200')
+    monkeypatch.setattr(mm,'DoubanClient',Mock(return_value=client))
+    result = plugin._match_subject({'title':'Show','media_type':'TV','season':season},
+                                   matching_reader(imdb_id='tt123',scope='series'))
+    assert bool(result[1]) is accepted
+
+
+def test_old_pending_movie_match_is_revalidated_and_never_written_on_failure(runtime,monkeypatch):
+    plugin, _, module, _ = runtime
+    key = '魔女嘉莉@mp-server'
+    record = {'title':'魔女嘉莉','source_title':'魔女嘉莉','type':'TV','source_media_type':'TV',
+              'season':1,'episode':3,'subject_id':'1292664','server_name':'mp-server','item_id':'ep'}
+    plugin.save_data('pending',{key:record})
+    reader = matching_reader(imdb_id='tt11540908',scope='series')
+    plugin._reader = Mock(return_value=reader)
+    mm = sys.modules[module.__name__ + '.matching']
+    client = Mock();client.find_by_imdb.return_value=(None,None)
+    monkeypatch.setattr(mm,'DoubanClient',Mock(return_value=client))
+    plugin._write_douban = Mock();plugin.retry_management = Mock();plugin._fill_missing_images = Mock()
+    plugin.retry_pending()
+    plugin._write_douban.assert_not_called()
+    assert plugin.get_data('pending')[key]['subject_id'] == ''
+    assert '编号' in plugin.get_data('pending')[key]['error']
+
+
+def test_normal_tv_identifier_mapping_to_movie_is_blocked_before_writing(runtime,monkeypatch):
+    plugin, _, module, _ = runtime
+    client=Mock();client.get_subject_info.return_value={'title':'Same title','media_type':'MOV'}
+    monkeypatch.setattr(module,'DoubanClient',Mock(return_value=client))
+    def found(payload,reader):
+        payload['match_method']='imdb'
+        return 'Same title','1292664'
+    plugin._match_subject=found;plugin._reader=Mock();plugin._write_douban=Mock()
+    plugin._sync_item_original({'title':'Show','media_type':'TV','season':1,'episode':3,'server_name':'mp-server'})
+    plugin._write_douban.assert_not_called()
+    row=next(iter(plugin.get_data('pending').values()))
+    assert '冲突' in row['error'] and not row['subject_id']
+
+
+def test_unidentified_special_does_not_inherit_parent_series_douban_id(runtime):
+    """
+    S00 当前单集无标识时，不借用主剧的豆瓣条目。
+    """
+    plugin = runtime[0]
+    reader = matching_reader(scope='episode',imdb_id='',tmdb_id='',douban_id='')
+    assert plugin._match_subject({'title':'Special','media_type':'TV','season':0,'episode':7},reader) == (None,None)
+
+
+def test_failed_imdb_mapping_can_recover_on_next_attempt(runtime,monkeypatch):
+    """
+    查询失败不能缓存为永久无条目，下一次应重新获取。
+    """
+    plugin, _, module, _ = runtime
+    mm = sys.modules[module.__name__ + '.matching']
+    client = Mock();client.find_by_imdb.side_effect = [(None,None),('Carrie','37083974')]
+    monkeypatch.setattr(mm,'DoubanClient',Mock(return_value=client))
+    reader = matching_reader(imdb_id='tt11540908',scope='series')
+    payload = {'title':'魔女嘉莉','media_type':'TV','season':1}
+    assert plugin._match_subject(payload,reader) == (None,None)
+    assert plugin._match_subject(payload,reader)[1] == '37083974'
+    assert client.find_by_imdb.call_count == 2
+
+
+def test_rescan_does_not_write_an_old_title_match_when_source_ids_disagree(runtime):
+    """
+    重扫发现源编号与旧档案不一致时保留记录，不修改豆瓣标记。
+    """
+    plugin = runtime[0]
+    key = archive_record(plugin)
+    plugin.data['archive'][key].update(type='电视剧',status='do',season=1,item_id='series')
+    plugin.save_data('subject_details',{'100':{'title':'Show','media_type':'TV','expires':9999999999}})
+    reader = Mock();reader.get_series_id.return_value = 'series'
+    plugin._reader = Mock(return_value=reader)
+    plugin._tv_completion = Mock(return_value={'complete':True,'known':True,'episodes':[1,2],'played':[1,2],'expected':2})
+    plugin._match_subject = Mock(return_value=('Correct version','200'))
+    plugin._write_douban = Mock()
+    result = plugin.rescan_archive()
+    plugin._write_douban.assert_not_called()
+    assert result['skipped'] == 1 and plugin.get_data('archive')[key]['subject_id'] == '100'
+
+
+def test_read_only_diagnosis_skips_guarded_record_without_counter_error(runtime):
+    """
+    人工处理中或已停用的记录在诊断接口中直接跳过，不访问不存在的重扫计数器。
+    """
+    plugin = runtime[0]
+    archive_record(plugin)
+    plugin._manual_guard = Mock(return_value=True)
+    plugin._available_libraries = Mock(return_value=[])
+    assert plugin.api_diagnose()['items'] == []
+
+
+def name_year_client(runtime,monkeypatch,candidates):
+    """
+    模拟公开候选及详情，不访问豆瓣或宿主数据库。
+    """
+    mm = sys.modules[runtime[2].__name__ + '.matching']
+    client=Mock();client.search_candidates.return_value=candidates
+    client.get_subject_info.side_effect=lambda subject,kind: next(dict(item) for item in candidates if item['subject_id']==subject)
+    monkeypatch.setattr(mm,'DoubanClient',Mock(return_value=client))
+    return client
+
+
+@pytest.mark.parametrize('kind,candidate_kind,accepted',[('MOV','MOV',True),('MOV','TV',False),('TV','MOV',False),('TV','TV',True)])
+def test_title_year_fallback_requires_exact_type_for_ordinary_works(runtime,monkeypatch,kind,candidate_kind,accepted):
+    """
+    名称及年份相同也不能混淆电影和普通电视剧。
+    """
+    client=name_year_client(runtime,monkeypatch,[{'subject_id':'200','title':'Carrie','year':2026,'media_type':candidate_kind}])
+    payload={'title':'魔女嘉莉','media_type':kind,'season':1 if kind=='TV' else 0}
+    result=runtime[0]._match_by_title_year(payload,{'title':'魔女嘉莉','original_title':'Carrie','year':2026})
+    assert bool(result[1]) is accepted
+    if accepted:assert payload['match_method']=='title_year' and payload['match_year']==2026
+
+
+@pytest.mark.parametrize('year,title',[(1976,'Carrie'),(2026,'Carrie 2')])
+def test_title_year_does_not_accept_wrong_year_or_partial_title(runtime,monkeypatch,year,title):
+    """
+    拒绝旧版同名电影和仅包含主标题的续作。
+    """
+    name_year_client(runtime,monkeypatch,[{'subject_id':'1292664','title':title,'year':year,'media_type':'MOV'}])
+    result=runtime[0]._match_by_title_year({'title':'Carrie','media_type':'MOV'}, {'title':'Carrie','year':2026})
+    assert result==(None,None)
+
+
+def test_ambiguous_exact_title_year_results_require_manual_choice(runtime,monkeypatch):
+    """
+    两个条目均满足名称、年份和类型时，不选搜索首条。
+    """
+    name_year_client(runtime,monkeypatch,[{'subject_id':str(n),'title':'Carrie','year':2026,'media_type':'MOV'} for n in [100,200]])
+    payload={'title':'Carrie','media_type':'MOV'}
+    assert runtime[0]._match_by_title_year(payload,{'title':'Carrie','year':2026})==(None,None)
+    assert '唯一' in payload['subject_error']
+
+
+def test_second_season_uses_tmdb_season_air_year_instead_of_emby_series_year(runtime,monkeypatch):
+    """
+    Emby 将 S02 年份沿用 S01 时，以 TMDB 第二季首播日期为依据。
+    """
+    plugin=runtime[0]
+    plugin._tmdb_detail=Mock(return_value={'season_number':2,'air_date':'2028-05-12'})
+    client=name_year_client(runtime,monkeypatch,[{'subject_id':'200','title':'Example 第二季','year':2028,'media_type':'TV'}])
+    payload={'title':'Example','media_type':'TV','season':2}
+    metadata={'title':'Example','year':2026,'season_year':2026,'tmdb_id':'123','scope':'series','media_type':'TV'}
+    assert plugin._match_by_title_year(payload,metadata)[1]=='200'
+    assert payload['match_year']==2028
+    assert all(call.args[1]==2028 for call in client.search_candidates.call_args_list)
+    plugin._tmdb_detail.assert_called_once_with(metadata,2)
+
+
+def test_second_season_without_reliable_year_never_uses_first_season_year(runtime,monkeypatch):
+    """
+    无当前季日期且 Emby 仍是第一季年份时，保留待匹配。
+    """
+    plugin=runtime[0];plugin._tmdb_detail=Mock(return_value=None)
+    client=name_year_client(runtime,monkeypatch,[])
+    payload={'title':'Example','media_type':'TV','season':2}
+    assert plugin._match_by_title_year(payload,{'title':'Example','year':2026,'season_year':2026,'tmdb_id':'123','scope':'series'})==(None,None)
+    assert '当前季' in payload['subject_error']
+    client.search_candidates.assert_not_called()
+
+
+@pytest.mark.parametrize('title,accepted',[('Example',False),('Example 第一季',False),('Example 第二季',True)])
+def test_same_year_cannot_replace_explicit_season_verification(runtime,monkeypatch,title,accepted):
+    """
+    即使年份正确，后续季仍必须有对应季号。
+    """
+    plugin=runtime[0];plugin._season_year=Mock(return_value=2028)
+    name_year_client(runtime,monkeypatch,[{'subject_id':'200','title':title,'year':2028,'media_type':'TV'}])
+    assert bool(plugin._match_by_title_year({'title':'Example','media_type':'TV','season':2},{'title':'Example','year':2026})[1]) is accepted
+
+
+@pytest.mark.parametrize('kind',['MOV','TV'])
+def test_special_title_year_can_match_a_douban_movie_or_special_series(runtime,monkeypatch,kind):
+    """
+    S00 的特别篇使用本篇名称及年份，可对应影片或独立剧集。
+    """
+    client=name_year_client(runtime,monkeypatch,[{'subject_id':'200','title':'特别篇作品','year':2024,'media_type':kind}])
+    payload={'title':'主剧','media_type':'TV','season':0,'episode':36}
+    result=runtime[0]._match_by_title_year(payload,{'title':'特别篇作品','series_title':'主剧','year':2024,'scope':'episode'})
+    assert result[1]=='200'
+    assert all(call.args[0]=='特别篇作品' for call in client.search_candidates.call_args_list)
+
+
+def test_imdb_and_tmdb_attempts_precede_title_year_fallback(runtime,monkeypatch):
+    """
+    Emby IMDb 无结果时仍尝试 TMDB 转换的 IMDb，再决定是否按名称兜底。
+    """
+    plugin,_,module,_=runtime
+    mm=sys.modules[module.__name__+'.matching']
+    client=Mock();client.find_by_imdb.side_effect=[(None,None),('Carrie','37083974')]
+    monkeypatch.setattr(mm,'DoubanClient',Mock(return_value=client))
+    plugin._tmdb_imdb=Mock(return_value='tt11540908')
+    plugin._match_by_title_year=Mock(side_effect=AssertionError('do not fall back before both identifiers'))
+    result=plugin._match_subject({'title':'Carrie','media_type':'TV','season':1},matching_reader(imdb_id='tt9999',tmdb_id='288673',scope='series'))
+    assert result[1]=='37083974'
+    assert [call.args[0] for call in client.find_by_imdb.call_args_list]==['tt9999','tt11540908']
+
+
+def test_both_identifier_failures_reach_exact_title_year_fallback(runtime,monkeypatch):
+    """
+    两种外部编号均无结果后，允许唯一且严格一致的名称年份候选。
+    """
+    plugin=runtime[0]
+    client=name_year_client(runtime,monkeypatch,[{'subject_id':'200','title':'Carrie','year':2026,'media_type':'MOV'}])
+    client.find_by_imdb.return_value=(None,None)
+    plugin._tmdb_imdb=Mock(return_value='tt456')
+    metadata={'title':'Carrie','year':2026,'imdb_id':'tt123','tmdb_id':'123','scope':'movie','media_type':'MOV'}
+    payload={'title':'Carrie','media_type':'MOV'}
+    assert plugin._match_subject(payload,matching_reader(**metadata))[1]=='200'
+    assert [call.args[0] for call in client.find_by_imdb.call_args_list]==['tt123','tt456']
+    assert payload['match_method']=='title_year'
+
+
+def test_emby_current_season_year_is_used_when_tmdb_is_unavailable(runtime):
+    """
+    当前季年份明确不同于主剧首播年时，可使用 Emby 当前季年份。
+    """
+    plugin=runtime[0];plugin._tmdb_detail=Mock(return_value=None)
+    assert plugin._season_year({'scope':'series','tmdb_id':'123','year':2026,'season_year':2028},2)==2028
+
+
+def test_tmdb_can_confirm_two_seasons_released_in_same_calendar_year(runtime):
+    """
+    TMDB 明确第二季首播日期时，即使与第一季同年也可确认。
+    """
+    plugin=runtime[0];plugin._tmdb_detail=Mock(return_value={'season_number':2,'air_date':'2026-11-01'})
+    assert plugin._season_year({'scope':'series','tmdb_id':'123','year':2026,'season_year':2026},2)==2026
+
+
+def test_current_season_metadata_does_not_use_series_production_year(runtime,monkeypatch):
+    """
+    普通剧集保留 Series 编号，同时单独读取当前季的年份。
+    """
+    mm=sys.modules[runtime[2].__name__+'.mediaserver'];reader=mm.MediaServerReader()
+    items={'ep':{'Type':'Episode','SeriesId':'show','SeasonId':'s2'},
+           'show':{'Type':'Series','Name':'Example','ProductionYear':2026,'ProviderIds':{'Tmdb':'123'}},
+           's2':{'Type':'Season','IndexNumber':2,'ProductionYear':2026,'PremiereDate':'2028-05-01'}}
+    reader.get_item=Mock(side_effect=lambda key:items.get(key,{}))
+    result=reader.get_match_metadata('ep','TV',2,3)
+    assert result['year']==2026 and result['season_year']=='2028' and result['tmdb_id']=='123'
+
+
+def test_special_generic_episode_name_cannot_fall_back_to_parent_show_title(runtime,monkeypatch):
+    """
+    S00 只有泛化集名时，不能拿观看事件中的主剧名寻找豆瓣主剧条目。
+    """
+    client=name_year_client(runtime,monkeypatch,[{'subject_id':'100','title':'Parent Show','year':2026,'media_type':'TV'}])
+    payload={'title':'Parent Show','media_type':'TV','season':0,'episode':3}
+    result=runtime[0]._match_by_title_year(payload,{'title':'Episode 3','year':2026,'scope':'episode'})
+    assert result==(None,None)
+    client.search_candidates.assert_not_called()

@@ -1,8 +1,8 @@
 """豆瓣观看同步：把媒体服务器的播放进度同步到豆瓣「书影音档案」。
 
 设计要点：
-1. 不依赖 TMDB 识别，TMDB 不可用时仍能完成同步；
-2. 豆瓣 ID 优先取媒体服务器已刮削的标识，取不到才用豆瓣搜索；
+1. 使用 Emby 的 IMDb，或通过 TMDB 编号取得 IMDb，准确对应豆瓣条目；
+2. 手动编号优先；编号无结果时按名称、年份、类型和季号核对，不使用搜索首条；
 3. 网络请求全部放到宿主的延后任务里执行，不阻塞 webhook 事件线程；
 4. 同步失败的条目进入待处理队列，由定时服务重试。
 """
@@ -79,7 +79,7 @@ class DoubanWatchSync(SubjectRouting, AutomaticLogin, WatchManagement, _PluginBa
     plugin_name = "豆瓣观看同步"
     plugin_desc = "将在看、看完状态同步到豆瓣书影音档案；支持多媒体服务器路由、独立档案与重试队列。"
     plugin_icon = "https://raw.githubusercontent.com/gken6/MoviePilot-Plugins/main/icons/doubanwatchsync.svg"
-    plugin_version = "2.3.9"
+    plugin_version = "2.3.10"
     plugin_author = "gken6"
     author_url = "https://github.com/gken6"
     plugin_config_prefix = "doubanwatchsync_"
@@ -276,7 +276,6 @@ class DoubanWatchSync(SubjectRouting, AutomaticLogin, WatchManagement, _PluginBa
 
         for key, record in archive.items():
             if self._manual_guard(key) or not self._direct_record_allowed(record):
-                summary["skipped"] += 1
                 continue
             if not isinstance(record, dict):
                 continue
@@ -703,10 +702,12 @@ class DoubanWatchSync(SubjectRouting, AutomaticLogin, WatchManagement, _PluginBa
         key = self._routing_key(payload)
 
         reader = self._reader(server_name, username=str(payload.get("user_name") or "") or None, user_id=self._user_id_for(str(payload.get("user_name") or "") or None, server_name))
-        subject_id = self._manual_subject(key) or payload.get("subject_id") or reader.get_douban_id(payload.get("item_id") or "")
+        subject_id = self._manual_subject(key)
         subject_name = title
-        if not subject_id:
-            subject_name, subject_id = self._search_subject(work_title(title), season, media_type)
+        if subject_id:
+            payload["match_method"] = "manual"
+        else:
+            subject_name, subject_id = self._match_subject(payload, reader)
         client = DoubanClient(cookie=self._load_cookie())
         if subject_id:
             detail = self._subject_detail(client, str(subject_id), media_type)
@@ -715,6 +716,11 @@ class DoubanWatchSync(SubjectRouting, AutomaticLogin, WatchManagement, _PluginBa
                 self._save_pending(key, payload, subject_name, season, media_type, "do", str(subject_id))
                 return
             media_type = detail["media_type"]
+            if (payload.get("match_method") in {"imdb", "tmdb_imdb", "title_year"}
+                    and self._source_kind(payload) == "TV" and season > 0 and media_type != "TV"):
+                payload["subject_error"] = "编号对应豆瓣影片，与当前普通剧集冲突，请手动核对"
+                self._save_pending(key, payload, title, season, "TV", "do")
+                return
             subject_name = detail.get("title") or subject_name
             key, payload = self._bind_subject_kind(key, payload, media_type)
             if media_type == "MOV":
@@ -787,26 +793,33 @@ class DoubanWatchSync(SubjectRouting, AutomaticLogin, WatchManagement, _PluginBa
                     continue
                 if not isinstance(record, dict):
                     continue
-                subject_id = self._manual_subject(key) or str(record.get("subject_id") or "")
+                subject_id = self._manual_subject(key)
                 status = str(record.get("status") or "do")
                 display = str(record.get("display") or key)
-                if not subject_id:
-                    # 之前没搜到条目，重新尝试搜索
-                    subject_name, found = self._search_subject(
-                        str(record.get("title") or key),
-                        self._to_int(record.get("season"), 0, 0),
-                        str(record.get("type") or "TV"),
-                    )
-                    if not found:
-                        logger.warn(f"{display} 仍未找到豆瓣条目")
+                reader = self._reader(record.get("server_name"), username=record.get("user_name"))
+                if subject_id:
+                    record["match_method"] = "manual"
+                else:
+                    subject_name, subject_id = self._match_subject(record, reader)
+                    if not subject_id:
+                        record["subject_id"] = ""
+                        record["error"] = record.get("subject_error") or "尚未确认豆瓣编号"
+                        with self._lock:
+                            current = self.get_data(_KEY_PENDING) or {}
+                            if key in current:
+                                current[key] = record
+                                self.save_data(_KEY_PENDING, current)
+                        logger.warn(f"{display} 尚未按编号确认豆瓣条目")
                         continue
-                    subject_id, record["subject_id"] = found, found
-                    record["subject_name"] = subject_name
-                hint = "TV" if str(record.get("type") or "").startswith(("TV", "电视剧")) else "MOV"
+                    record.update(subject_id=subject_id, subject_name=subject_name)
+                hint = self._source_kind(record)
                 detail = self._subject_detail(client, subject_id, hint)
                 if not detail:
                     continue
                 kind = detail["media_type"]
+                if (record.get("match_method") in {"imdb", "tmdb_imdb", "title_year"}
+                        and self._source_kind(record) == "TV" and int(record.get("season") or 0) > 0 and kind != "TV"):
+                    continue
                 key, record = self._bind_subject_kind(key, record, kind)
                 record.update(type=kind, subject_name=detail.get("title") or record.get("subject_name"))
                 if detail.get("title"):
@@ -944,6 +957,13 @@ class DoubanWatchSync(SubjectRouting, AutomaticLogin, WatchManagement, _PluginBa
                     summary["failed"] += 1
                     continue
 
+                if not self._manual_subject(key):
+                    _, confirmed = self._match_subject(record, reader)
+                    if confirmed != subject_id:
+                        step["result"] = "源编号未能确认原豆瓣条目，请手动修正匹配"
+                        summary["skipped"] += 1
+                        continue
+
                 if self._write_douban(client, "set_status", subject_id=subject_id, status=target_status, private=self._private):
                     step["result"] = "写入豆瓣成功，已修正观看状态"
                     with self._lock:
@@ -989,6 +1009,10 @@ class DoubanWatchSync(SubjectRouting, AutomaticLogin, WatchManagement, _PluginBa
                 "title": display,
                 "subject_name": subject_name,
                 "subject_id": subject_id,
+                "match_metadata": payload.get("match_metadata") or {},
+                "match_method": payload.get("match_method") or "",
+                "matched_imdb": payload.get("matched_imdb") or "",
+                "match_year": int(payload.get("match_year") or 0),
                 "season": season,
                 "episode": self._to_int(payload.get("episode"), 0, 0),
                 "source_media_type": payload.get("source_media_type") or payload.get("media_type") or media_type,
@@ -1048,6 +1072,10 @@ class DoubanWatchSync(SubjectRouting, AutomaticLogin, WatchManagement, _PluginBa
                 "display": self._display_title(subject_name, season),
                 "subject_name": subject_name,
                 "subject_id": subject_id,
+                "match_metadata": payload.get("match_metadata") or {},
+                "match_method": payload.get("match_method") or "",
+                "matched_imdb": payload.get("matched_imdb") or "",
+                "match_year": int(payload.get("match_year") or 0),
                 "season": season,
                 "episode": self._to_int(payload.get("episode"), 0, 0),
                 "source_media_type": payload.get("source_media_type") or payload.get("media_type") or media_type,
@@ -1121,24 +1149,6 @@ class DoubanWatchSync(SubjectRouting, AutomaticLogin, WatchManagement, _PluginBa
         }
 
     # ---------------- 辅助能力 ----------------
-
-    def _search_subject(self, title: str, season: int, media_type: str) -> Tuple[Optional[str], Optional[str]]:
-        """
-        按标题搜索豆瓣条目。
-        先尝试带季数的标题（部分剧集按季单独建条目），再退回主标题。
-        """
-        client = DoubanClient()
-        candidates = []
-        season_title = self._display_title(title, season)
-        if season_title != title:
-            candidates.append(season_title)
-        candidates.append(title)
-
-        for candidate in candidates:
-            subject_name, subject_id = client.search(candidate, media_type)
-            if subject_id:
-                return subject_name, subject_id
-        return None, None
 
     def _tv_completion(self, payload: dict, reader: MediaServerReader, subject_id: str = "") -> dict:
         """合并同一豆瓣作品各服务器的分集证据，再判断是否全部看完。"""

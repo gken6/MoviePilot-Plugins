@@ -5,9 +5,10 @@ import copy
 import time
 
 from .episodes import work_title
+from .matching import IdentifierMatching
 
 
-class SubjectRouting:
+class SubjectRouting(IdentifierMatching):
     @staticmethod
     def _source_kind(record):
         value = str(record.get("source_media_type") or record.get("media_type") or record.get("type") or "")

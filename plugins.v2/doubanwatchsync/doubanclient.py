@@ -76,6 +76,92 @@ class DoubanClient:
             pass
         return None
 
+    def search_candidates(self, title: str, year: int, media_type: str, season: int = 0) -> list:
+        """
+        返回名称、年份搜索的候选，不直接选择第一条。
+
+        :param title: 源元数据中的名称或原名。
+        :param year: 已确认的电影年份或当前季首播年份。
+        :param media_type: Emby 判定的搜索类型，S00 由调用方分别查询。
+        :param season: 普通剧集当前季号。
+        :return: 至多二十个待进一步核验的豆瓣候选。
+        """
+        query = f"{title} 第{season}季 {year}" if media_type == "TV" and season > 1 else f"{title} {year}"
+        try:
+            from app.modules.douban.apiv2 import DoubanApi
+            api = DoubanApi()
+            response = api.tv_search(query) if media_type == "TV" else api.movie_search(query)
+        except Exception:
+            return []
+        candidates = []
+        for item in self._iter_items(response):
+            subject = str(item.get("id") or "")
+            if subject.isdigit():
+                candidates.append({**self._identity_fields(item), "subject_id": subject,
+                                   "title": str(item.get("title") or ""), "media_type": self._detail_type(item)})
+        return candidates[:20]
+
+    @staticmethod
+    def _identity_fields(detail: dict) -> dict:
+        """
+        提取公开条目用于名称、年份、IMDb 及季号核验的字段。
+
+        :param detail: 豆瓣候选或条目详情。
+        :return: 不含账号信息的身份字段。
+        """
+        import re
+        year = re.search(r"(?:18|19|20|21)\d{2}", str(detail.get("year") or ""))
+        aliases = detail.get("aka") or detail.get("aliases") or []
+        if isinstance(aliases, str):
+            aliases = [aliases]
+        if not isinstance(aliases, list):
+            aliases = []
+        imdb = str(detail.get("imdb_id") or detail.get("imdb") or "")
+        found = re.search(r"tt\d+", imdb, re.I)
+        return {"year": int(year[0]) if year else 0, "original_title": str(detail.get("original_title") or ""),
+                "aliases": [str(value) for value in aliases if isinstance(value, str)],
+                "imdb_id": found[0].lower() if found else "", "season_number": detail.get("season_number") or 0}
+
+    def find_by_imdb(self, imdb_id: str) -> Tuple[Optional[str], Optional[str]]:
+        """
+        使用宿主豆瓣 IMDb 映射接口确认作品，不使用名称搜索兜底。
+
+        :param imdb_id: 源媒体元数据的 IMDb 编号。
+        :return: 豆瓣标题和纯数字条目编号；无法确认时返回空值。
+        """
+        import re
+        imdb_id = str(imdb_id or "").lower()
+        if not re.fullmatch(r"tt\d+", imdb_id):
+            return None, None
+        try:
+            from app.modules.douban.apiv2 import DoubanApi
+            result = DoubanApi().imdbid(imdb_id)
+        except Exception as error:
+            logger.debug(f"按 IMDb 查询豆瓣失败：{type(error).__name__}")
+            return None, None
+        if not isinstance(result, dict) or not result.get("title"):
+            return None, None
+        raw = str(result.get("id") or "")
+        if raw.isdigit():
+            subject = raw
+        else:
+            parsed = urlsplit(raw)
+            if parsed.scheme not in {"http", "https"} or parsed.hostname not in {"api.douban.com", "movie.douban.com"}:
+                return None, None
+            matched = re.fullmatch(r"/(?:movie|subject)/(\d+)/?", parsed.path)
+            subject = matched.group(1) if matched else ""
+        if not subject:
+            return None, None
+        # 个别接口返回外部编号时，同时拒绝明确冲突的响应。
+        attrs = result.get("attrs") or {}
+        declared = result.get("imdb_id") or result.get("imdb") or (attrs.get("imdb") if isinstance(attrs, dict) else None)
+        if declared:
+            values = declared if isinstance(declared, list) else [declared]
+            known = set(re.findall(r"tt\d+", " ".join(map(str, values)), re.I))
+            if known and imdb_id not in {value.lower() for value in known}:
+                return None, None
+        return str(result["title"]), subject
+
     def search(self, title: str, media_type: str = "TV") -> Tuple[Optional[str], Optional[str]]:
         """
         搜索豆瓣影视条目，返回 (条目标题, subject_id)。
@@ -410,7 +496,7 @@ class DoubanClient:
                 pic = detail.get("pic") or {}
                 image = next((pic.get(key) for key in ("large", "normal", "medium", "small") if pic.get(key)), "") if isinstance(pic, dict) else ""
                 kind = self._detail_type(detail)
-                fallback = {"title": str(detail["title"]), "image": str(image), "episodes_count": detail.get("episodes_count") or 0,
+                fallback = {**self._identity_fields(detail), "title": str(detail["title"]), "image": str(image), "episodes_count": detail.get("episodes_count") or 0,
                             "media_type": kind}
                 if kind == "MOV" or (kind == "TV" and fallback["episodes_count"]):
                     return fallback
@@ -435,7 +521,13 @@ class DoubanClient:
                     kind = "MOV"
                 if not kind:
                     kind = self._form_subject_type(subject_id)
-                return {"title": title.get_text(strip=True), "image": str(image.get("src") or "") if image else "",
+                year_node = soup.select_one("h1 .year")
+                year = re.search(r"\d{4}", year_node.get_text() if year_node else "")
+                imdb = re.search(r"IMDb\s*[:：]?\s*(tt\d+)", text, re.I)
+                aliases = re.search(r"又名\s*[:：]\s*([^\n]+)", info.get_text("\n", strip=True) if info else "")
+                return {"year": int(year[0]) if year else 0, "imdb_id": imdb[1].lower() if imdb else "",
+                        "aliases": [value.strip() for value in aliases[1].split("/")] if aliases else [],
+                        "title": title.get_text(strip=True), "image": str(image.get("src") or "") if image else "",
                         "episodes_count": int(count.group(1)) if count else 0, "media_type": kind}
         except Exception:
             pass

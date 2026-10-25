@@ -107,6 +107,9 @@ class MediaServerReader:
         # 运行时解析出的 userId，解析失败时回退到宿主默认（管理员）
         self._user_id: Optional[str] = None
         self._user_resolved = False
+        self._located = None
+        self._located_name = ""
+        self._located_type = ""
 
     # ---------------- 对外能力 ----------------
 
@@ -133,6 +136,66 @@ class MediaServerReader:
         data = response if isinstance(response, dict) else {}
         self._cache[cache_key] = data
         return data
+
+    def get_match_metadata(self, item_id: str, media_type: str, season: int = 0,
+                           episode: int = 0) -> Dict[str, Any]:
+        """
+        读取作品级标识；普通剧集取 Series，S00 特别篇仅取对应单集。
+
+        :param item_id: 观看事件的媒体条目编号，可为单集或 Series。
+        :param media_type: 事件原始类型，TV 或 MOV。
+        :param season: 正在观看的季号，0 表示特别篇。
+        :param episode: 正在观看的集号，用于 Series 事件定位 S00 单集。
+        :return: 仅含影视标识、标题及年份的字典，不含服务器凭据。
+        """
+        item = self.get_item(item_id)
+        if not item:
+            return {}
+        event_item = item
+        kind = str(item.get("Type") or "")
+        if media_type == "TV" and season == 0 and kind in {"Series", "Season"}:
+            series = self.get_series_id(item_id)
+            rows = self.get_season_episode_items(series, 0) if series else []
+            matches = [row for row in rows if self._to_int(row.get("IndexNumber")) == episode]
+            if len(matches) != 1:
+                return {}
+            item = self.get_item(str(matches[0].get("Id") or "")) or matches[0]
+            kind = str(item.get("Type") or "Episode")
+        elif media_type == "TV" and season > 0 and kind != "Series":
+            series = item.get("SeriesId")
+            if not series:
+                return {}
+            item = self.get_item(str(series))
+            if item.get("Type") != "Series":
+                return {}
+            kind = "Series"
+        season_item = {}
+        if kind == "Series" and season > 1:
+            season_id = event_item.get("SeasonId")
+            if season_id:
+                season_item = self.get_item(str(season_id))
+            if not season_item or self._to_int(season_item.get("IndexNumber")) != season:
+                instance, _ = self._locate()
+                response = self._get(instance, self._user_scope_url(instance,
+                    f"/emby/Shows/{item.get('Id') or item_id}/Seasons")) if instance else None
+                rows = response.get("Items") if isinstance(response, dict) else []
+                matches = [row for row in rows or [] if isinstance(row, dict) and self._to_int(row.get("IndexNumber")) == season]
+                season_item = matches[0] if len(matches) == 1 else {}
+        providers = {str(key).lower(): str(value).strip()
+                     for key, value in (item.get("ProviderIds") or {}).items() if value is not None}
+        imdb = providers.get("imdb", "").lower()
+        tmdb = providers.get("tmdb", "")
+        return {"imdb_id": imdb if re.fullmatch(r"tt\d+", imdb) else "",
+                "tmdb_id": tmdb if tmdb.isdigit() else "",
+                "douban_id": self._pick_douban(item.get("ProviderIds")) or "",
+                "media_type": "TV" if kind in {"Series", "Episode", "Season"} else "MOV",
+                "scope": "series" if kind == "Series" else "episode" if kind == "Episode" else "movie",
+                "title": str(item.get("Name") or ""), "original_title": str(item.get("OriginalTitle") or ""),
+                "series_title": str(item.get("SeriesName") or event_item.get("SeriesName")
+                                    or (event_item.get("Name") if event_item.get("Type") == "Series" else "") or ""),
+                "season_year": str(season_item.get("PremiereDate") or season_item.get("ProductionYear") or "")[:4],
+                "year": (str(item.get("PremiereDate") or "")[:4] or item.get("ProductionYear"))
+                        if kind == "Episode" else item.get("ProductionYear")}
 
     def get_douban_id(self, item_id: str) -> Optional[str]:
         """
