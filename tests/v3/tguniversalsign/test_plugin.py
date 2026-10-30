@@ -227,6 +227,6 @@ def test_vue_frontend_exists_without_replacing_task_configuration(runtime):
     plugin, _, _ = runtime
     mode, directory = plugin.get_render_mode()
     # Path is patched by the isolated fixture; the render contract itself remains a host Vue panel.
-    assert mode == 'vue' and directory.endswith('frontend/dist')
+    assert mode == 'vue' and directory == 'frontend/dist/assets'
     assert (ROOT / 'frontend/dist/assets/remoteEntry.js').is_file()
     assert (ROOT / 'frontend/dist/assets/sign.js').is_file()

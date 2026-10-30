@@ -56,7 +56,7 @@ class TgUniversalSign(_PluginBase):
     plugin_name = "TG万能签到"
     plugin_desc = "使用 TG 个人账号，按频道逐行执行自定义命令。"
     plugin_icon = "https://raw.githubusercontent.com/gken6/MoviePilot-Plugins/main/icons/tguniversalsign.svg"
-    plugin_version = "0.3.4"
+    plugin_version = "0.3.5"
     plugin_author = "gken6"
     author_url = "https://github.com/gken6"
     plugin_config_prefix = "tguniversalsign_"
@@ -585,7 +585,7 @@ class TgUniversalSign(_PluginBase):
 
         :return: 渲染类型与静态文件目录。
         """
-        return "vue", str(Path(__file__).parent / "frontend" / "dist")
+        return "vue", "frontend/dist/assets"
 
     def api_ui_overview(self, page: int = 1, search: str = "", state: str = "all") -> dict:
         """

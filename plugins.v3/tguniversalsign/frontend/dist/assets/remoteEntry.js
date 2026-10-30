@@ -25,9 +25,9 @@ export async function get(name) {
   if (!stylesheet && typeof document !== 'undefined') {
     stylesheet = document.createElement('link');
     stylesheet.rel = 'stylesheet';
-    stylesheet.href = new URL('sign.css?v=0.3.4', import.meta.url).href;
+    stylesheet.href = new URL('sign.css?v=0.3.5', import.meta.url).href;
     document.head.appendChild(stylesheet);
   }
-  const module = await import('./sign.js?v=0.3.4');
+  const module = await import('./sign.js?v=0.3.5');
   return () => module[component];
 }
