@@ -75,5 +75,21 @@ assert.ok(flatten(combinedPage()).some(n=>n.type==='span'&&n.children==='2 台�
 const movieInSeason=Page.setup({api:{get:async()=>({servers:[],archive:[{key:'s00-movie',title:'前篇',type:'电影',season:1,expected_episodes:0,status:'collect'}],pending:[],unmatched:[]})}},{emit:()=>{}});
 for(const fn of mounted.splice(0))await fn();
 assert.ok(!flatten(movieInSeason()).some(n=>n.children==='第1季'||n.children==='总集数待获取'));
+const targetWrites=[];
+const targetProps={pluginId:'DoubanWatchSync',initialConfig:{},api:{get:async path=>path.includes('/form/')?{conf:[{content:rows}],model:{}}:{servers:[],archive:[],pending:[],unmatched:[],cookie_target:{url:'http://configured.test',username:'admin',password_saved:true,status:'未同步'}},post:async(path,body)=>{targetWrites.push({path,body});return {success:true,message:'已保存'};}}};
+const targetConfig=Config.setup(targetProps,{emit:()=>{}});
+for(const fn of mounted.splice(0))await fn();
+let nodes=flatten(targetConfig());
+assert.ok(nodes.some(n=>n.type==='h3'&&n.children==='神医助手 Cookie 同步'));
+for(const [label,value] of [['Emby 地址','http://current-form.test:8096'],['Emby 管理员用户名','admin'],['Emby 管理员密码','simulated-secret']]) {
+ const input=nodes.find(n=>n.props['aria-label']===label);
+ assert.ok(input); if(label.includes('密码')) assert.equal(input.props.type,'password');
+ input.props.onInput({target:{value}});
+}
+nodes.find(n=>n.props['aria-label']==='自动同步新 Cookie').props.onChange({target:{checked:true}});
+await flatten(targetConfig()).find(n=>n.props['aria-label']==='立即同步 Cookie').props.onClick();
+assert.equal(targetWrites[0].path,'plugin/DoubanWatchSync/cookie-target');
+assert.deepEqual(targetWrites[0].body,{action:'sync',url:'http://current-form.test:8096',username:'admin',password:'simulated-secret',enabled:true});
+assert.equal(flatten(targetConfig()).find(n=>n.props['aria-label']==='Emby 管理员密码').props.value,'');
 for(const fn of unmounted)fn();
 console.log('前端配置、登录、海报、跨服务器合并进度和仪表盘刷新：通过');

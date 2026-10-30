@@ -64,7 +64,7 @@ def runtime(monkeypatch):
     spec = importlib.util.spec_from_file_location(name, ROOT / '__init__.py', submodule_search_locations=[str(ROOT)])
     plugin_module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, name, plugin_module)
-    for suffix in ('doubanclient', 'mediaserver', 'management', 'auth', 'qrnotify'):
+    for suffix in ('doubanclient', 'mediaserver', 'management', 'auth', 'qrnotify', 'embycookie'):
         monkeypatch.setitem(sys.modules, name + '.' + suffix, None)
         sys.modules.pop(name + '.' + suffix)
     spec.loader.exec_module(plugin_module)
@@ -2563,3 +2563,247 @@ def test_special_generic_episode_name_cannot_fall_back_to_parent_show_title(runt
     result=runtime[0]._match_by_title_year(payload,{'title':'Episode 3','year':2026,'scope':'episode'})
     assert result==(None,None)
     client.search_candidates.assert_not_called()
+
+# 神医助手 Cookie 同步只在隔离边界模拟网络与凭据。
+def cookie_module(runtime):
+    return sys.modules[runtime[2].__name__ + '.embycookie']
+
+
+def configure_cookie_target(runtime, **overrides):
+    body = dict(action='save', url='http://emby.test:8096', username='admin', password='secret', enabled=True)
+    body.update(overrides)
+    assert runtime[0].api_cookie_target(body)['success']
+    return cookie_module(runtime)
+
+
+def test_cookie_target_is_private_and_independent(runtime):
+    module = configure_cookie_target(runtime)
+    plugin = runtime[0]
+    public = plugin.api_management()['cookie_target']
+    assert public['password_saved'] and public['enabled']
+    assert not {'password', 'token', 'cookie'} & public.keys()
+    assert plugin.config == {}
+    assert not any(job[0] == 'emby_cookie_forward' for job in runtime[3])
+    assert plugin.get_data(module.TARGET)['password'] == 'secret'
+    route = next(r for r in plugin.management_api() if r['path'] == '/cookie-target')
+    assert route['dependencies'] and route['auth'] == 'bear'
+
+
+def test_cookie_password_blank_retains_only_for_same_target(runtime):
+    module = configure_cookie_target(runtime)
+    configure_cookie_target(runtime, password='')
+    assert runtime[0].get_data(module.TARGET)['password'] == 'secret'
+    configure_cookie_target(runtime, password='', url='http://different.test')
+    assert not runtime[0].get_data(module.TARGET)['password']
+
+
+@pytest.mark.parametrize('url', ['ftp://emby.test', 'https://u:p@emby.test', 'http://emby.test?a=b', 'http://emby.test/#part', 'http://emby.test:bad', 'http://em\nby.test'])
+def test_cookie_target_invalid_url(runtime, url):
+    assert not runtime[0].api_cookie_target(dict(url=url, username='admin'))['success']
+
+
+def install_cookie_client(runtime, monkeypatch, failure=None, hook=None):
+    module = cookie_module(runtime)
+    calls = []
+    class Client:
+        def __init__(self, config, session, guard): self.config, self.guard = config, guard
+        def authenticate(self): return dict(token='own-session', user_id='adminid', target_key=module.target_key(self.config))
+        def sync(self, cookie):
+            if hook: hook()
+            if self.guard(): calls.append(cookie)
+            if failure: raise RuntimeError(failure)
+    monkeypatch.setattr(module, 'EmbyAssistantClient', Client)
+    return calls
+
+
+def test_cookie_auto_queue_deduplicates_and_new_cookie_triggers(runtime, monkeypatch):
+    module = configure_cookie_target(runtime)
+    calls = install_cookie_client(runtime, monkeypatch)
+    plugin = runtime[0]
+    plugin._on_verified_cookie('valid-cookie-a')
+    count = len(runtime[3])
+    plugin._on_verified_cookie('valid-cookie-a')
+    assert len(runtime[3]) == count
+    runtime[3][-1][1]()
+    assert calls == ['valid-cookie-a']
+    assert plugin.get_data(module.RESULT)['status'] == '同步成功'
+    plugin._on_verified_cookie('valid-cookie-a')
+    assert len(runtime[3]) == count
+    plugin._on_verified_cookie('valid-cookie-b')
+    runtime[3][-1][1]()
+    assert calls == ['valid-cookie-a', 'valid-cookie-b']
+
+
+def test_cookie_auto_off_manual_still_queues_with_current_form(runtime, monkeypatch):
+    module = configure_cookie_target(runtime, enabled=False)
+    plugin = runtime[0]
+    calls = install_cookie_client(runtime, monkeypatch)
+    plugin._on_verified_cookie('not-sent')
+    assert not any(j[0] == 'emby_cookie_forward' for j in runtime[3])
+    plugin._manual_forward_cookie = Mock(return_value='manually-verified-cookie')
+    configure_cookie_target(runtime, action='sync', enabled=False, url='http://new-target.test')
+    runtime[3][-1][1]()
+    assert calls == ['manually-verified-cookie']
+    assert plugin.get_data(module.TARGET)['url'] == 'http://new-target.test'
+
+
+@pytest.mark.parametrize('invalidate', ['target', 'stop', 'new-cookie'])
+def test_old_cookie_task_cannot_write_after_change(runtime, monkeypatch, invalidate):
+    configure_cookie_target(runtime)
+    calls = install_cookie_client(runtime, monkeypatch)
+    plugin = runtime[0]
+    plugin._on_verified_cookie('old-cookie')
+    old = runtime[3][-1][1]
+    if invalidate == 'target': configure_cookie_target(runtime, url='http://another.test')
+    elif invalidate == 'stop': plugin._stop_cookie_forward()
+    else: plugin._on_verified_cookie('new-cookie')
+    old()
+    assert calls == []
+
+
+def test_cookie_failure_does_not_break_douban_login_and_has_cooldown(runtime, monkeypatch):
+    module = configure_cookie_target(runtime)
+    calls = install_cookie_client(runtime, monkeypatch, failure='Emby 连接失败')
+    plugin = runtime[0]
+    plugin._on_verified_cookie('valid-cookie')
+    runtime[3][-1][1]()
+    assert calls == ['valid-cookie']
+    assert plugin.get_data(module.RESULT)['status'] == '同步失败'
+    count = len(runtime[3]); plugin._on_verified_cookie('valid-cookie')
+    assert len(runtime[3]) == count
+    monkeypatch.setattr(plugin, '_queue_cookie_forward', Mock(side_effect=RuntimeError('queue unavailable')))
+    plugin._on_verified_cookie('valid-cookie')  # Cannot raise into the successful Douban operation.
+
+
+@pytest.mark.parametrize('valid,expected', [(True, True), (False, False), (None, False)])
+def test_only_verified_cookie_is_forwarded(runtime, monkeypatch, valid, expected):
+    configure_cookie_target(runtime)
+    plugin = runtime[0]
+    client = runtime[1].DoubanClient(cookie='dbcl2=simulated; ck=simulated')
+    plugin._remember_cookie(client, plugin._credential_key, valid)
+    assert any(j[0] == 'emby_cookie_forward' for j in runtime[3]) is expected
+
+
+def test_manual_cookie_priority_and_uncertain_state_never_written(runtime, monkeypatch):
+    configure_cookie_target(runtime)
+    module, plugin = cookie_module(runtime), runtime[0]
+    plugin._cookie = 'manual'; plugin._auth_record = Mock(return_value={'cookie': 'saved'})
+    seen = []
+    def factory(**kwargs):
+        seen.append(kwargs['cookie'])
+        return types.SimpleNamespace(login_state=lambda: kwargs['cookie'] == 'saved', cookie_header=lambda: kwargs['cookie'])
+    monkeypatch.setattr(module, 'DoubanClient', factory)
+    assert plugin._manual_forward_cookie() == 'saved' and seen == ['manual', 'saved']
+    monkeypatch.setattr(module, 'DoubanClient', lambda **kwargs: types.SimpleNamespace(login_state=lambda: None))
+    with pytest.raises(RuntimeError, match='无法确认'): plugin._manual_forward_cookie()
+
+
+def assistant_view(cookie='old'):
+    return {'PageId': '63c322:MetadataEnhancePageView', 'EditObjectContainer': {'Object': {
+        'EnableDoubanAssistScraping': True, 'Other': [1, 2], 'MetadataRefreshOptions': {
+            'DoubanCookie': cookie, 'DoubanAccessToken': 'preserved', 'RatingUpdateLookbackDays': 3}}},
+        'Commands': [{'CommandId': 'PageSave', 'IsEnabled': True}]}
+
+
+def test_assistant_client_only_changes_cookie_and_checks_readback(runtime):
+    module = cookie_module(runtime)
+    config = dict(url='http://emby.test', username='admin', password='secret')
+    client = module.EmbyAssistantClient(config, {})
+    client.session = {'user_id': 'adminid'}
+    view = assistant_view(); calls = []
+    def request(path, data=None):
+        calls.append((path, copy.deepcopy(data)))
+        if path.startswith('web/configurationpages'):
+            return [{'PluginId': module.PLUGIN_ID, 'Name': 'MetadataEnhancePageView', 'Href': 'genericui?PageId=63c322%3AMetadataEnhancePageView'}]
+        if path == 'UI/Command':
+            assert data['CommandId'] == 'PageSave'
+            updated = __import__('json').loads(data['Data'])
+            expected = copy.deepcopy(view['EditObjectContainer']['Object'])
+            expected['MetadataRefreshOptions']['DoubanCookie'] = 'new'
+            assert updated == expected
+            view['EditObjectContainer']['Object'] = updated
+            return view
+        return copy.deepcopy(view)
+    client._request = request
+    client.sync('new')
+    assert len([p for p, _ in calls if p.startswith('UI/View')]) == 2
+    assert not any('cookie=' in p.lower() for p, _ in calls)
+
+
+@pytest.mark.parametrize('mode', ['missing-page', 'missing-field', 'disabled-save', 'readback-failed'])
+def test_assistant_incompatible_protocol_does_not_claim_success(runtime, mode):
+    module = cookie_module(runtime)
+    client = module.EmbyAssistantClient(dict(url='http://emby.test', username='admin'), {})
+    client.session = {'user_id': 'adminid'}
+    view = assistant_view(); writes = []
+    if mode == 'missing-field': del view['EditObjectContainer']['Object']['MetadataRefreshOptions']['DoubanCookie']
+    if mode == 'disabled-save': view['Commands'][0]['IsEnabled'] = False
+    def request(path, data=None):
+        if path.startswith('web/configurationpages'):
+            return [] if mode == 'missing-page' else [{'PluginId': module.PLUGIN_ID, 'Name': 'MetadataEnhancePageView', 'Href': 'genericui?PageId=63c322%3AMetadataEnhancePageView'}]
+        if data: writes.append(data)
+        return copy.deepcopy(view)
+    client._request = request
+    with pytest.raises(RuntimeError): client.sync('new')
+    assert len(writes) == (1 if mode == 'readback-failed' else 0)
+
+
+def test_assistant_auth_is_bound_to_admin_and_target(runtime):
+    module = cookie_module(runtime)
+    config = dict(url='http://emby.test', username='admin', password='secret')
+    client = module.EmbyAssistantClient(config, {'token': 'foreign', 'target_key': 'wrong', 'user_id': 'other'})
+    calls = []
+    def request(path, data=None):
+        calls.append(path)
+        assert not client.token
+        return {'AccessToken': 'own', 'User': {'Id': 'id', 'Name': 'admin', 'Policy': {'IsAdministrator': True}}}
+    client._request = request
+    session = client.authenticate()
+    assert calls == ['Users/AuthenticateByName'] and session['token'] == 'own'
+    assert session['target_key'] == module.target_key(config)
+    client._request = Mock(return_value={'AccessToken': 'ordinary', 'User': {'Name': 'admin', 'Policy': {'IsAdministrator': False}}})
+    client.session = {}
+    with pytest.raises(PermissionError): client.authenticate()
+
+
+def test_cookie_scheduler_failure_can_be_retried_manually(runtime, monkeypatch):
+    module = configure_cookie_target(runtime)
+    plugin = runtime[0]
+    schedule = plugin._schedule_once
+    monkeypatch.setattr(plugin, '_schedule_once', Mock(side_effect=RuntimeError('unavailable')))
+    plugin._on_verified_cookie('valid')
+    assert plugin._cookie_forward_pending is None
+    assert plugin.get_data(module.RESULT)['status'] == '同步失败'
+    monkeypatch.setattr(plugin, '_schedule_once', schedule)
+    plugin._queue_cookie_forward('', manual=True)
+    assert runtime[3][-1][0] == 'emby_cookie_forward'
+
+
+def test_cookie_browser_login_result_triggers_only_on_success(runtime, monkeypatch):
+    configure_cookie_target(runtime)
+    plugin = runtime[0]
+    plugin._auth_ready = lambda: True
+    plugin._save_auth_result({'status': '需要验证', 'cookie': 'unverified'}, plugin._credential_key, {})
+    assert not any(j[0] == 'emby_cookie_forward' for j in runtime[3])
+    plugin._save_auth_result({'status': '登录正常', 'cookie': 'verified'}, plugin._credential_key, {})
+    assert runtime[3][-1][0] == 'emby_cookie_forward'
+
+
+def test_assistant_http_boundary_redacts_errors_and_never_redirects(runtime):
+    module = cookie_module(runtime)
+    client = module.EmbyAssistantClient(dict(url='http://emby.test', username='admin'), {})
+    client.token = 'sensitive-token'
+    seen = []
+    class Opener:
+        def open(self, request, timeout):
+            seen.append(request)
+            raise module.urllib.error.HTTPError(request.full_url, 401, 'secret-response', {}, None)
+    client.opener = Opener()
+    with pytest.raises(PermissionError) as error: client._request('UI/Command', {'Data': 'sensitive-cookie'})
+    assert 'sensitive' not in str(error.value) and 'secret' not in str(error.value)
+    assert seen[0].headers['X-emby-token'] == 'sensitive-token'
+    assert 'sensitive' not in seen[0].full_url
+    assert module._NoRedirect().redirect_request(None, None, 302, '', {}, 'http://different.test') is None
+    client.guard = lambda: False
+    with pytest.raises(RuntimeError, match='取消'): client._request('UI/Command', {})
+    assert len(seen) == 1

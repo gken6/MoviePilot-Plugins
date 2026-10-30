@@ -79,7 +79,7 @@ class DoubanWatchSync(SubjectRouting, AutomaticLogin, WatchManagement, _PluginBa
     plugin_name = "豆瓣观看同步"
     plugin_desc = "将在看、看完状态同步到豆瓣书影音档案；支持多媒体服务器路由、独立档案与重试队列。"
     plugin_icon = "https://raw.githubusercontent.com/gken6/MoviePilot-Plugins/main/icons/doubanwatchsync.svg"
-    plugin_version = "2.3.10"
+    plugin_version = "2.3.11"
     plugin_author = "gken6"
     author_url = "https://github.com/gken6"
     plugin_config_prefix = "doubanwatchsync_"
@@ -329,6 +329,7 @@ class DoubanWatchSync(SubjectRouting, AutomaticLogin, WatchManagement, _PluginBa
     def stop_service(self) -> None:
         """停止时取消未执行的延后任务并关闭状态。"""
         self._remove_once("retry_pending_once")
+        self._stop_cookie_forward()
         self._enabled = False
 
     # ---------------- 事件处理 ----------------

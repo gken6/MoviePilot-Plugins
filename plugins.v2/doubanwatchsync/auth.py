@@ -8,6 +8,7 @@ import time
 from urllib.parse import urlsplit
 
 from app.log import logger
+from .embycookie import EmbyCookieForwarding
 
 AUTH_DATA = "douban_login"
 LOGIN_URL = "https://accounts.douban.com/passport/login?redir=https%3A%2F%2Fmovie.douban.com%2F"
@@ -139,10 +140,11 @@ def browser_login(username: str, password: str, *, on_qr=None, should_continue=N
                 pass
 
 
-class AutomaticLogin:
+class AutomaticLogin(EmbyCookieForwarding):
     """账号续登与写入失败恢复；Cookie/密码只保存在 NAS 插件空间。"""
 
     def _auth_init(self, config: dict) -> None:
+        self._emby_cookie_init()
         if not hasattr(self, "_login_lock"):
             self._login_lock = threading.RLock()
         self._auto_login = bool(config.get("auto_login", False))
@@ -221,6 +223,8 @@ class AutomaticLogin:
                 if messages:
                     messages.put("豆瓣观看同步：" + record["message"])
         self.save_data(AUTH_DATA, record)
+        if successful:
+            self._on_verified_cookie(result["cookie"])
         return successful
 
     def _renew_login(self, client) -> bool:
@@ -272,6 +276,8 @@ class AutomaticLogin:
             record.update(cookie=client.cookie_header(), user_agent=client.user_agent,
                           checked_at=time.time() if valid else 0)
         self.save_data(AUTH_DATA, record)
+        if valid is True:
+            self._on_verified_cookie(client.cookie_header())
         return True
 
     def _forget_manual_cookie_check(self, key: str) -> None:
@@ -308,6 +314,7 @@ class AutomaticLogin:
                 if is_manual:
                     checked = record.get("manual_checked_at") if record.get("manual_cookie_key") == credential_key(client.cookie_header(), "") else 0
                 if not force and (is_manual or saved) and record.get("status") == "登录正常" and time.time() - float(checked or 0) < 600:
+                    self._on_verified_cookie(client.cookie_header())
                     return True
                 valid = client.login_state()
                 if valid is not False:

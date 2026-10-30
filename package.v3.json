@@ -2,7 +2,7 @@
   "DoubanWatchSync": {
     "name": "豆瓣观看同步",
     "description": "将观看状态同步到豆瓣，支持独立直连 Emby、多服务器管理、人工匹配与无条目排除。",
-    "version": "2.3.10",
+    "version": "2.3.11",
     "author": "gken6",
     "level": 1,
     "icon": "https://raw.githubusercontent.com/gken6/MoviePilot-Plugins/main/icons/doubanwatchsync.svg",
@@ -11,6 +11,7 @@
     "plugin_schema_version": 1,
     "release": false,
     "history": {
+      "2.3.11": "新增神医助手 Cookie 同步：独立设置 Emby 地址及管理员账号密码；有效新 Cookie 自动同步，也可手动同步，后台执行并回读确认。",
       "2.3.10": "优先按 Emby IMDb/TMDB 编号对应豆瓣；无结果时严格核对名称、年份、类型和季号。S00 独立处理，后续季优先使用当前季首播年，重试及重扫重新核对旧匹配。",
       "2.3.9": "按豆瓣官方条目及标记表单识别影片/剧集，修复 S00 影片被改成在看导致失败；影片编号仅绑定对应单集，防止前后篇错误复用。",
       "2.3.8": "合并同一豆瓣作品跨服务器的逐集观看进度，重复集数去重；统一完成判定与已同步记录状态，避免服务器互相覆盖。",

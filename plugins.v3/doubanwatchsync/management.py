@@ -214,6 +214,7 @@ class WatchManagement:
             {"path": "/manage", "endpoint": self.api_management, "methods": ["GET"], "auth": "bear", "dependencies": [Depends(require_manager)]},
             {"path": "/servers", "endpoint": self.api_server, "methods": ["POST"], "auth": "bear", "dependencies": [Depends(require_manager)]},
             {"path": "/login", "endpoint": self.api_login, "methods": ["POST"], "auth": "bear", "dependencies": [Depends(require_manager)]},
+            {"path": "/cookie-target", "endpoint": self.api_cookie_target, "methods": ["POST"], "auth": "bear", "dependencies": [Depends(require_manager)]},
             {"path": "/match", "endpoint": self.api_match, "methods": ["POST"], "auth": "bear", "dependencies": [Depends(require_manager)]},
         ]
 
@@ -266,7 +267,8 @@ class WatchManagement:
                                "target_status": (operation.get("record") or {}).get("status", "")})
             return sorted(result, key=lambda row: row.get("timestamp", ""), reverse=True)
         result = {"servers": servers, "archive": rows(archive), "pending": rows(pending),
-                  "unmatched": rows(ignored), "enabled": self._enabled, "login": self._auth_public()}
+                  "unmatched": rows(ignored), "enabled": self._enabled, "login": self._auth_public(),
+                  "cookie_target": self._cookie_target_public()}
         self._queue_record_images(missing_images)
         return result
 

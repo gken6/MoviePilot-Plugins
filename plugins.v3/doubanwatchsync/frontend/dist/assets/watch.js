@@ -132,6 +132,23 @@ export const Config = defineComponent({
     const model = reactive({ ...(props.initialConfig || {}) });
     const rows = ref([]), error = ref(''), saving = ref(false);
     const login = useManagement(props);
+    const target = reactive({ url: '', username: '', password: '', enabled: false });
+    const targetDirty = ref(false), targetSaving = ref(false), targetFeedback = ref(''), targetFailed = ref(false);
+    watch(() => login.data.value.cookie_target, value => {
+      if (value && !targetDirty.value) Object.assign(target, { url: value.url || '', username: value.username || '', enabled: !!value.enabled });
+    }, { immediate: true });
+    function changeTarget(key, value) { target[key] = value; targetDirty.value = true; }
+    async function saveTarget(action) {
+      if (targetSaving.value) return;
+      targetSaving.value = true; targetFeedback.value = '';
+      if (await login.mutate('cookie-target', { action, ...target })) {
+        target.password = ''; targetDirty.value = false;
+        const current = login.data.value.cookie_target;
+        if (current) Object.assign(target, { url: current.url || '', username: current.username || '', enabled: !!current.enabled });
+      }
+      targetFeedback.value = login.message.value; targetFailed.value = login.failed.value;
+      targetSaving.value = false;
+    }
     onMounted(async () => {
       emit('layout', { maxWidth: '76rem' });
       try {
@@ -174,6 +191,27 @@ export const Config = defineComponent({
             login.data.value.login?.last_login ? h('small', `上次自动登录：${new Date(login.data.value.login.last_login * 1000).toLocaleString()}`) : null,
             login.data.value.login?.next_attempt ? h('small', ` · 重试冷却至：${new Date(login.data.value.login.next_attempt * 1000).toLocaleString()}`) : null,
           ]),
+        ]),
+        h('section', { class: 'dw-cookie-target' }, [
+          h('div', { class: 'dw-section-head' }, [h('div', [h('h3', '神医助手 Cookie 同步'), h('p', '将有效的豆瓣 Cookie 同步到指定 Emby 服务器')]),
+            h('label', { class: 'dw-toggle', title: '自动同步新 Cookie' }, [h('input', { type: 'checkbox', role: 'switch', 'aria-label': '自动同步新 Cookie', checked: target.enabled,
+              onChange: event => changeTarget('enabled', event.target.checked) }), h('span')])]),
+          h('div', { class: 'dw-cookie-fields' }, [
+            field('Emby 地址', target.url, value => changeTarget('url', value), { placeholder: 'http://192.168.50.191:8096' }),
+            field('Emby 管理员用户名', target.username, value => changeTarget('username', value)),
+            field('Emby 管理员密码', target.password, value => changeTarget('password', value), { type: 'password', autocomplete: 'new-password',
+              placeholder: login.data.value.cookie_target?.password_saved ? '已保存，留空保留原密码' : '填写管理员密码' }),
+          ]),
+          h('div', { class: 'dw-cookie-actions' }, [h('div', { role: 'status', 'aria-live': 'polite', class: 'dw-cookie-state' }, [
+            h('strong', login.data.value.cookie_target?.status || '未同步'),
+            login.data.value.cookie_target?.message ? h('small', login.data.value.cookie_target.message) : null,
+            login.data.value.cookie_target?.last_success ? h('small', `上次成功：${new Date(login.data.value.cookie_target.last_success * 1000).toLocaleString()}`) : null,
+          ]), h('div', { class: 'dw-row-actions' }, [
+            button('保存连接设置', () => saveTarget('save'), { disabled: targetSaving.value }),
+            button('立即同步 Cookie', () => saveTarget('sync'), { primary: true, disabled: targetSaving.value || login.data.value.cookie_target?.status === '正在同步' }),
+          ])]),
+          targetFeedback.value ? h('div', { role: 'status', class: ['dw-notice', targetFailed.value && 'dw-error'] }, targetFeedback.value) : null,
+          h('p', { class: 'dw-subtle' }, '开启右上角开关并保存后，新 Cookie 验证成功会自动同步。立即同步会同时保存当前连接设置；密码留空保留，切换地址或账号后请重新填写。'),
         ]),
         h('section', { class: 'dw-native dw-settings' }, [h('h3', '同步操作'),
           h('p', { class: 'dw-subtle' }, '需要手动处理历史记录时使用；勾选后保存执行一次。'),
