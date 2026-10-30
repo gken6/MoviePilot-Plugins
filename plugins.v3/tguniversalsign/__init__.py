@@ -56,7 +56,7 @@ class TgUniversalSign(_PluginBase):
     plugin_name = "TG万能签到"
     plugin_desc = "使用 TG 个人账号，按频道逐行执行自定义命令。"
     plugin_icon = "https://raw.githubusercontent.com/gken6/MoviePilot-Plugins/main/icons/tguniversalsign.svg"
-    plugin_version = "0.3.3"
+    plugin_version = "0.3.4"
     plugin_author = "gken6"
     author_url = "https://github.com/gken6"
     plugin_config_prefix = "tguniversalsign_"
@@ -227,6 +227,7 @@ class TgUniversalSign(_PluginBase):
             {"path": "/status", "endpoint": self.api_status, "auth": "bear", "methods": ["GET"], "summary": "查看 Telegram 登录状态"},
             {"path": "/run", "endpoint": self.api_run, "auth": "bear", "methods": ["POST"], "summary": "立即执行全部配置任务"},
         ]
+        routes.append({"path": "/ui/overview", "endpoint": self.api_ui_overview, "auth": "bear", "methods": ["GET"]})
         for route in routes:
             route["dependencies"] = [Depends(require_manager)]
         return routes
@@ -576,3 +577,47 @@ class TgUniversalSign(_PluginBase):
 
     def api_run(self):
         return self.run_tasks()
+
+
+    def get_render_mode(self):
+        """
+        使用宿主 Vue 插件面板，配置与历史页面共用一致的界面。
+
+        :return: 渲染类型与静态文件目录。
+        """
+        return "vue", str(Path(__file__).parent / "frontend" / "dist")
+
+    def api_ui_overview(self, page: int = 1, search: str = "", state: str = "all") -> dict:
+        """
+        仅读取本地历史分页及概况，打开界面不会连接 Telegram 或执行任务。
+
+        :param page: 从一开始的历史页码。
+        :param search: 目标和回复中的搜索文字。
+        :param state: all、success 或 failed。
+        :return: 不含账号密钥和会话内容的概况与历史。
+        """
+        records = self.__load_history()
+        needle = str(search or "").strip().casefold()
+        selected = [item for item in records
+                    if (state not in {"success", "failed"} or bool(item.get("success")) == (state == "success"))
+                    and (not needle or needle in " ".join(str(item.get(k) or "") for k in
+                                                         ("target", "trigger", "summary", "detail")).casefold())]
+        pages = max(1, (len(selected) + 19) // 20)
+        page = min(max(int(page or 1), 1), pages)
+        rows = []
+        for item in selected[(page - 1) * 20:page * 20]:
+            row = {key: item.get(key) for key in ("time", "created_at", "target", "trigger", "summary", "detail")}
+            row["success"] = bool(item.get("success"))
+            try:
+                row["duration"] = max(0, float(item.get("duration") or 0))
+            except (TypeError, ValueError):
+                row["duration"] = 0
+            rows.append(row)
+        latest = records[0] if records else {}
+        return {"records": rows, "total": len(selected), "page": page, "pages": pages,
+                "stats": {"total": len(records), "success": sum(bool(r.get("success")) for r in records),
+                          "failed": sum(not bool(r.get("success")) for r in records)},
+                "latest": {"time": latest.get("time") or latest.get("created_at") or "", "success": latest.get("success")},
+                "enabled": self._enabled, "cron": self._cron,
+                "account_configured": bool(self._api_id and self._api_hash and self._phone),
+                "session_saved": self._session_path.with_suffix(".session").is_file()}

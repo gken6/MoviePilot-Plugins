@@ -157,9 +157,9 @@ def test_history_retention_and_output_cleanup(runtime):
 def test_account_management_endpoints_require_admin(runtime):
     plugin, module, _ = runtime
     routes = plugin.get_api()
-    assert len(routes) == 5
+    assert {r['path'] for r in routes} == {'/send_code', '/login', '/login_2fa', '/status', '/run', '/ui/overview'}
     assert all(route['dependencies'] == [module.require_manager] for route in routes)
-    assert all(route['methods'] == (['GET'] if route['path'] == '/status' else ['POST']) for route in routes)
+    assert all(route['methods'] == (['GET'] if route['path'] in {'/status', '/ui/overview'} else ['POST']) for route in routes)
     with pytest.raises(module.HTTPException) as error:
         module.require_manager(types.SimpleNamespace(super_user=False))
     assert error.value.status_code == 403
@@ -206,3 +206,27 @@ def test_import_error_names_the_missing_module_without_account_details(runtime,m
     values=module._import_telegram_deps()
     assert values[:2]==(None,None)
     assert module._TELEGRAM_IMPORT_ERROR=='telethon'
+
+
+def test_overview_is_local_paginated_filtered_and_redacted(runtime):
+    plugin, module, _ = runtime
+    records = [{'time': f'2026-10-30 09:{i:02d}', 'target': '@bot_a' if i % 2 else '@bot_b',
+                'success': i % 2 == 0, 'summary': '已签到' if i % 2 == 0 else '超时', 'duration': i} for i in range(45)]
+    plugin._TgUniversalSign__load_history = lambda: records
+    result = plugin.api_ui_overview(page=2)
+    assert result['total'] == 45 and result['page'] == 2 and result['pages'] == 3
+    assert len(result['records']) == 20 and result['stats'] == {'total': 45, 'success': 23, 'failed': 22}
+    filtered = plugin.api_ui_overview(state='failed', search='bot_a', page=999)
+    assert filtered['total'] == 22 and filtered['page'] == 2 and len(filtered['records']) == 2
+    assert all(not r['success'] for r in filtered['records'])
+    assert not {'api_hash', 'phone', 'phone_code_hash', 'api_id'} & result.keys()
+    module.TelegramClient.assert_not_called()
+
+
+def test_vue_frontend_exists_without_replacing_task_configuration(runtime):
+    plugin, _, _ = runtime
+    mode, directory = plugin.get_render_mode()
+    # Path is patched by the isolated fixture; the render contract itself remains a host Vue panel.
+    assert mode == 'vue' and directory.endswith('frontend/dist')
+    assert (ROOT / 'frontend/dist/assets/remoteEntry.js').is_file()
+    assert (ROOT / 'frontend/dist/assets/sign.js').is_file()

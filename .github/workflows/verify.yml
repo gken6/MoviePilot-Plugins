@@ -24,4 +24,5 @@ jobs:
       - run: python tests/v3/tguniversalsign/run_isolated.py
       - run: node tests/v2/doubanwatchsync/frontend.mjs
       - run: node tests/v3/doubanwatchsync/frontend.mjs
+      - run: node tests/v3/tguniversalsign/frontend.mjs
       - run: git diff --check
