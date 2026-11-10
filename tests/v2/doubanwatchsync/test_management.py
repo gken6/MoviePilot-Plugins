@@ -24,6 +24,7 @@ def runtime(monkeypatch):
         def __init__(self):
             self.data = {}
             self.config = {}
+            self.post_message = Mock()
         def get_data(self, key):
             return copy.deepcopy(self.data.get(key))
         def save_data(self, key, value):
@@ -1082,7 +1083,7 @@ def test_saved_cookie_has_priority_and_does_not_read_cloud(runtime, monkeypatch,
     assert client.cookies['dbcl2'] == 'fresh'
     plugin._download_cookiecloud_cookies.assert_not_called()
     browser.assert_not_called()
-
+    plugin.post_message.assert_not_called()
 
 def test_expired_local_uses_cloud_before_browser_and_saves_cloud(runtime, monkeypatch):
     plugin, auth, cm = enable_auto(runtime)
@@ -1108,7 +1109,8 @@ def test_expired_local_uses_cloud_before_browser_and_saves_cloud(runtime, monkey
     again.login_state = Mock(side_effect=AssertionError('recent saved cookie'))
     assert plugin._write_douban(again, 'set_status', '201', 'collect', True)
     plugin._download_cookiecloud_cookies.assert_called_once()
-
+    plugin.post_message.assert_called_once_with(mtype='plugin', title='豆瓣观看同步：Cookie 获取成功',
+                                                text='豆瓣登录 Cookie 已重新获取、验证并保存。')
 
 def test_both_cookie_sources_expired_then_browser_login(runtime, monkeypatch):
     plugin, auth, cm = enable_auto(runtime)
@@ -1203,7 +1205,7 @@ def test_cloud_check_network_error_does_not_trigger_account_login(runtime, monke
     assert not plugin._write_douban(client, 'set_status', '200', 'collect', True)
     assert plugin._auth_record()['status'] == '检查失败'
     browser.assert_not_called()
-
+    plugin.post_message.assert_not_called()
 
 def test_account_change_allows_explicit_cloud_fallback(runtime, monkeypatch):
     plugin, auth, cm = enable_auto(runtime)
@@ -2689,7 +2691,10 @@ def test_cookie_auto_queue_deduplicates_and_new_cookie_triggers(runtime, monkeyp
     plugin._on_verified_cookie('valid-cookie-b')
     runtime[3][-1][1]()
     assert calls == ['valid-cookie-a', 'valid-cookie-b']
-
+    assert plugin.post_message.call_count == 2
+    for call in plugin.post_message.call_args_list:
+        assert call.kwargs == {'mtype': 'plugin', 'title': '豆瓣观看同步：神医助手 Cookie 同步成功',
+                               'text': '豆瓣 Cookie 已同步到 Emby 神医助手，并回读确认。'}
 
 def test_cookie_auto_off_manual_still_queues_with_current_form(runtime, monkeypatch):
     module = configure_cookie_target(runtime, enabled=False)
@@ -2702,6 +2707,8 @@ def test_cookie_auto_off_manual_still_queues_with_current_form(runtime, monkeypa
     runtime[3][-1][1]()
     assert calls == ['manually-verified-cookie']
     assert plugin.get_data(module.TARGET)['url'] == 'http://new-target.test'
+    plugin.post_message.assert_called_once()
+    assert '神医助手 Cookie 同步成功' in plugin.post_message.call_args.kwargs['title']
 
 
 @pytest.mark.parametrize('invalidate', ['target', 'stop', 'new-cookie'])
@@ -2716,7 +2723,7 @@ def test_old_cookie_task_cannot_write_after_change(runtime, monkeypatch, invalid
     else: plugin._on_verified_cookie('new-cookie')
     old()
     assert calls == []
-
+    plugin.post_message.assert_not_called()
 
 def test_cookie_failure_does_not_break_douban_login_and_has_cooldown(runtime, monkeypatch):
     module = configure_cookie_target(runtime)
@@ -2739,7 +2746,7 @@ def test_only_verified_cookie_is_forwarded(runtime, monkeypatch, valid, expected
     client = runtime[1].DoubanClient(cookie='dbcl2=simulated; ck=simulated')
     plugin._remember_cookie(client, plugin._credential_key, valid)
     assert any(j[0] == 'emby_cookie_forward' for j in runtime[3]) is expected
-
+    plugin.post_message.assert_not_called()
 
 def test_manual_cookie_priority_and_uncertain_state_never_written(runtime, monkeypatch):
     configure_cookie_target(runtime)
@@ -2844,7 +2851,8 @@ def test_cookie_browser_login_result_triggers_only_on_success(runtime, monkeypat
     assert not any(j[0] == 'emby_cookie_forward' for j in runtime[3])
     plugin._save_auth_result({'status': '登录正常', 'cookie': 'verified'}, plugin._credential_key, {})
     assert runtime[3][-1][0] == 'emby_cookie_forward'
-
+    plugin.post_message.assert_called_once_with(mtype='plugin', title='豆瓣观看同步：Cookie 获取成功',
+                                                text='豆瓣登录 Cookie 已重新获取、验证并保存。')
 
 def test_assistant_http_boundary_redacts_errors_and_never_redirects(runtime):
     module = cookie_module(runtime)
@@ -2864,3 +2872,16 @@ def test_assistant_http_boundary_redacts_errors_and_never_redirects(runtime):
     client.guard = lambda: False
     with pytest.raises(RuntimeError, match='取消'): client._request('UI/Command', {})
     assert len(seen) == 1
+
+
+def test_success_notification_error_cannot_break_login_or_forward(runtime, monkeypatch):
+    module = configure_cookie_target(runtime)
+    calls = install_cookie_client(runtime, monkeypatch)
+    plugin = runtime[0]
+    plugin._auth_ready = lambda: True
+    plugin.post_message.side_effect = RuntimeError('notification transport failed')
+    assert plugin._save_auth_result({'status': '登录正常', 'cookie': 'verified'}, plugin._credential_key, {})
+    assert plugin._auth_record()['cookie'] == 'verified'
+    runtime[3][-1][1]()
+    assert calls == ['verified'] and plugin.get_data(module.RESULT)['status'] == '同步成功'
+    assert plugin.post_message.call_count == 2

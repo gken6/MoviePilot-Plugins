@@ -224,6 +224,7 @@ class AutomaticLogin(EmbyCookieForwarding):
                     messages.put("豆瓣观看同步：" + record["message"])
         self.save_data(AUTH_DATA, record)
         if successful:
+            self._notify_cookie_success()
             self._on_verified_cookie(result["cookie"])
         return successful
 
@@ -260,7 +261,17 @@ class AutomaticLogin(EmbyCookieForwarding):
         client._ck = client.cookies.get("ck") or ""
         client.user_agent = record.get("user_agent") or ""
 
-    def _remember_cookie(self, client, key: str, valid: bool | None, manual: bool = False) -> bool:
+    def _remember_cookie(self, client, key: str, valid: bool | None, manual: bool = False, *, from_cloud: bool = False) -> bool:
+        """
+        保存本次 Cookie 验证结果；仅新获取且验证通过的云 Cookie 发送通知。
+
+        :param client: 已安装本次 Cookie 的豆瓣客户端。
+        :param key: 当前豆瓣账号配置标识。
+        :param valid: 验证结果，None 表示无法确认。
+        :param manual: 是否为用户手填 Cookie。
+        :param from_cloud: 是否在本次回退中刚从 CookieCloud 获取。
+        :return: 当前配置下是否已记录验证结果。
+        """
         if not self._enabled or key != self._credential_key:
             client.last_error = "配置已改变或插件已停用，请重新同步"
             return False
@@ -277,6 +288,8 @@ class AutomaticLogin(EmbyCookieForwarding):
                           checked_at=time.time() if valid else 0)
         self.save_data(AUTH_DATA, record)
         if valid is True:
+            if from_cloud:
+                self._notify_cookie_success()
             self._on_verified_cookie(client.cookie_header())
         return True
 
@@ -333,7 +346,7 @@ class AutomaticLogin(EmbyCookieForwarding):
                 if client.cookies and client.cookies not in tried:
                     valid = client.login_state()
                     if valid is not False:
-                        return self._remember_cookie(client, key, valid)
+                        return self._remember_cookie(client, key, valid, from_cloud=True)
             if not self._enabled or key != self._credential_key:
                 client.last_error = "配置已改变或插件已停用，请重新同步"
                 return False

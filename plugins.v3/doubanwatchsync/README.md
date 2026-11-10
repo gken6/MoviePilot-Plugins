@@ -1,4 +1,4 @@
-# 豆瓣观看同步 2.3.11（MoviePilot V3）
+# 豆瓣观看同步 2.3.12（MoviePilot V3）
 
 由 gken6 维护。感谢 [honue](https://github.com/honue/MoviePilot-Plugins) 的“豆瓣书影音档案”插件。本插件中读取 MoviePilot 已配置媒体服务器的非直连功能，参考该插件改编；独立直连 Emby 的功能由 gken6 自主提出并设计，不依赖 MP 媒体服务器配置。来源与许可见 [NOTICE.md](NOTICE.md)。本次登录态调整保持 MP 媒体服务器的选择、用户名筛选、Webhook、轮询及观看状态判定逻辑。
 
@@ -41,6 +41,8 @@
 “立即同步 Cookie”同时保存当前连接输入并检查已有 Cookie，优先手填，再用插件保存值；不会额外触发账号或扫码登录。自动开关关闭时仍可手动同步。没有有效 Cookie 或网络状态无法确认时停止，不会清空神医助手原 Cookie。
 
 适配神医助手新版 Emby 通用配置页，已在 Strm Assistant Pro 3.0.0.52 实机验证。保存前读取配置，仅替换 `MetadataRefreshOptions.DoubanCookie`，通过官方 UI 保存接口生效，再回读核对。配置结构不兼容时停止。管理员账号密码及插件自行获取的会话仅存于插件数据，管理 API 不返回密码、Token 或 Cookie，连接不跟随重定向。建议使用可信内网或 HTTPS 地址。
+
+通过 MoviePilot 已配置的插件消息渠道通知：账号或扫码重新登录成功、或从 CookieCloud 取得新 Cookie 且验证通过时发送「Cookie 获取成功」；神医助手自动或手动同步回读确认后发送「神医助手 Cookie 同步成功」。日常复用已有 Cookie 不重复通知。消息不包含 Cookie、账号密码、Token 或服务器地址。
 
 ## 设置分组
 

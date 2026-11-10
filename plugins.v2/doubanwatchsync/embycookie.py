@@ -11,6 +11,8 @@ import urllib.parse
 import urllib.request
 
 from fastapi import Body
+from app.schemas.types import MessageType
+from app.log import logger
 
 from .doubanclient import DoubanClient
 
@@ -99,7 +101,7 @@ class EmbyAssistantClient:
         if base.endswith("/emby"):
             base = base[:-5]
         headers = {"Accept": "application/json", "Content-Type": "application/json",
-                   "X-Emby-Authorization": 'MediaBrowser Client="MoviePilot DoubanWatchSync", Device="MoviePilot", DeviceId="douban-cookie-forward", Version="2.3.11"'}
+                   "X-Emby-Authorization": 'MediaBrowser Client="MoviePilot DoubanWatchSync", Device="MoviePilot", DeviceId="douban-cookie-forward", Version="2.3.12"'}
         if self.token:
             headers["X-Emby-Token"] = self.token
         body = json.dumps(data, ensure_ascii=False).encode() if data is not None else None
@@ -256,6 +258,24 @@ class EmbyCookieForwarding:
             return {"success": True, "message": "已保存，正在后台同步当前有效 Cookie"}
         return {"success": True, "message": "已保存；新 Cookie 获取成功后会按开关自动同步"}
 
+    def _notify_cookie_success(self, *, emby: bool = False) -> None:
+        """
+        通过 MoviePilot 的插件消息渠道报告已完成的操作。
+
+        :param emby: 是否报告神医助手同步成功。
+        """
+        if emby:
+            title = "豆瓣观看同步：神医助手 Cookie 同步成功"
+            message = "豆瓣 Cookie 已同步到 Emby 神医助手，并回读确认。"
+        else:
+            title = "豆瓣观看同步：Cookie 获取成功"
+            message = "豆瓣登录 Cookie 已重新获取、验证并保存。"
+        try:
+            self.post_message(mtype=MessageType.Plugin, title=title, text=message)
+        except Exception:
+            # 通知通道故障不改变已经保存的登录或同步结果。
+            logger.warning("豆瓣 Cookie 成功通知提交失败")
+
     def _on_verified_cookie(self, cookie: str) -> None:
         """
         转发故障只更新独立结果，不能让已成功的豆瓣登录或观看同步失败。
@@ -340,6 +360,7 @@ class EmbyCookieForwarding:
             return (self._enabled and sequence == self._cookie_forward_sequence
                     and current.get("revision") == config.get("revision") and target_key(current) == key
                     and (manual or current.get("enabled")))
+        notify_success = False
         with self._cookie_forward_lock:
             if not allowed():
                 return
@@ -363,6 +384,9 @@ class EmbyCookieForwarding:
                 result.update(target_key=key, cookie_hash=hashlib.sha256(cookie.encode()).hexdigest(), attempted_at=time.time())
                 self.save_data(RESULT, result)
                 self._cookie_forward_pending = None
+                notify_success = result["status"] == "同步成功"
+        if notify_success:
+            self._notify_cookie_success(emby=True)
 
     def _stop_cookie_forward(self) -> None:
         """
